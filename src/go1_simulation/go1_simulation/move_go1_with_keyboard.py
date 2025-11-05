@@ -12,7 +12,10 @@ class KeyboardController(Node):
     """
     This is a ROS 2 node for controlling the Go1 robot with keyboard input.
     With keyboard input, you can move the robot go forward, go backward, rotate left, rotate right, and stop.
-    w: go forward, x: go backward, s: stop, a: left rotation, d: right rotation, q: quit
+    w: go forward, x: go backward, 
+    a: left rotation, d: right rotation, 
+    i: increase speed, o: decrease speed, 
+    s: stop, q: quit
     For the rotation, robot need small linear velocity. 
 
     You can also use CLI commands to move the robot.
