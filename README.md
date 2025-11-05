@@ -85,6 +85,9 @@ git clone https://github.com/roy9852/make_ai_robot.git
 Use `rosdep` to automatically install all required dependencies:
 
 ```bash
+sudo apt-get install python3-rosdep
+sudo rosdep init
+rosdep update
 cd ~/make_ai_robot
 rosdep install -i --from-path src --rosdistro $ROS_DISTRO -y
 ```
