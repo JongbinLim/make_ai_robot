@@ -136,6 +136,7 @@ make_ai_robot/
 ├── src/                    # Source code (you edit files here)
 │   ├── go1_simulation/
 │   ├── path_tracker/
+│   ├── environment/
 │   ├── ros2_unitree_legged_controller/
 │   ├── ros2_unitree_legged_msgs/
 │   └── unitree_guide2/

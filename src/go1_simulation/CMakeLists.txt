@@ -47,9 +47,6 @@ find_package(message_filters REQUIRED)       # Message synchronization utilities
 # SLAM and Navigation
 find_package(slam_toolbox REQUIRED)          # SLAM toolbox for mapping
 
-# Python Utilities
-find_package(ament_index_python REQUIRED)    # Package indexing utilities
-
 # URDF Processing
 find_package(xacro REQUIRED)                 # Xacro for URDF processing
 

@@ -9,7 +9,6 @@ project(aws_robomaker_hospital_world)
 ################################################################################
 find_package(ament_cmake REQUIRED)
 find_package(ros_gz_sim REQUIRED)
-find_package(ament_index_python REQUIRED)
 
 execute_process(COMMAND python3 -m pip install -r ${CMAKE_CURRENT_SOURCE_DIR}/requirements.txt
                 OUTPUT_QUIET ERROR_QUIET)
@@ -26,7 +25,6 @@ install(DIRECTORY launch models fuel_models worlds photos
 
 ament_export_dependencies(ament_cmake)
 ament_export_dependencies(ros_gz_sim)
-ament_export_dependencies(ament_index_python)
 
 ################################################################################
 # Macro for ament package
