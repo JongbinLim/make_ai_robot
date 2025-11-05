@@ -165,10 +165,10 @@ You should see both Gazebo and RViz:
 In Rviz, you can see colored 3D pointcloud from RGB-D camera and red 2D pointcloud from LiDAR
 
 
-<img src="images/start_gazebo.png" alt="Gazebo Simulation" width="600"/>
+<img src="images/start_gazebo.png?v=1" alt="Gazebo Simulation" width="600"/>
 
 
-<img src="images/start_rviz_1.png" alt="RViz Visualization 1" width="600"/>
+<img src="images/start_rviz_1.png?v=1" alt="RViz Visualization 1" width="600"/>
 
 **Launch Arguments:**
 - `world_file:=<world_name>.world` - Choose world (hopital, empty, cafe, house) (Default: hospital)
@@ -195,7 +195,7 @@ You should see the map in RViz:
 
 You can compare pointcloud and pre-built map
 
-<img src="images/start_rviz_2.png" alt="RViz Visualization 2" width="600"/>
+<img src="images/start_rviz_2.png?v=1" alt="RViz Visualization 2" width="600"/>
 
 ### 3. Unitree Guide Controller
 
