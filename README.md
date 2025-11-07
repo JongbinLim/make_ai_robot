@@ -1,6 +1,6 @@
-# ROS2 Practice Repository for Creating Robot Artificial Ingelligence Project (CRAIP)
+# Creating Robot Artificial Intelligence Project (CRAIP)
 
-This repository is for ROS2 practice of 2025 Fall "Creating Robot Artificial Ingelligence Project" class.
+This repository is for ROS2 practice of Fall 2025 "Creating Robot Artificial Intelligence Project" class.
 
 It contains a collection of ROS2 packages for simulating and controlling the Unitree Go1 quadruped robot.
 
@@ -15,7 +15,7 @@ To ensure you are working with the **latest version** of this project, please ru
 git pull origin main
 ```
 
-Be careful not to remove your local changes
+**Note:** Be careful not to overwrite your local changes when pulling updates
 
 ---
 
@@ -66,6 +66,11 @@ High-level locomotion controller for Unitree Go1 robot.
 - Trotting gait implementation
 - ROS2 integration for simulation
 
+### 6. **environment**
+Worlds and models for simulation.
+- World files like hospital.world, empty.world, etc.
+- Models which will be used in the world files
+
 ---
 
 ## 📥 Installation
@@ -89,6 +94,7 @@ sudo apt-get install python3-rosdep
 sudo rosdep init
 rosdep update
 cd ~/make_ai_robot
+# This command will take a while
 rosdep install -i --from-path src --rosdistro $ROS_DISTRO -y
 ```
 
@@ -106,17 +112,19 @@ colcon build
 You should see:
 ```bash
 Starting >>> ros2_unitree_legged_msgs
+Starting >>> aws_robomaker_hospital_world
 Starting >>> path_tracker
-Finished <<< ros2_unitree_legged_msgs [8.90s]                                    
+Starting <<< aws_robomaker_hospital_world [2.13s]
+Finished <<< ros2_unitree_legged_msgs [10.2s]                                    
 Starting >>> ros2_unitree_legged_control
 Starting >>> unitree_guide2
-Finished <<< ros2_unitree_legged_control [11.9s]                        
+Finished <<< ros2_unitree_legged_control [14.9s]                        
 Starting >>> go1_simulation
-Finished <<< path_tracker [21.5s]                                       
-Finished <<< go1_simulation [1.59s]                                      
-Finished <<< unitree_guide2 [19.3s]                       
+Finished <<< path_tracker [25.6s]                                       
+Finished <<< go1_simulation [2.41s]                                      
+Finished <<< unitree_guide2 [20.0s]                       
 
-Summary: 5 packages finished [28.3s]
+Summary: 6 packages finished [30.4s]
 ```
 
 ### Step 4: Source the Workspace
@@ -129,6 +137,13 @@ Add to your `~/.bashrc` for automatic sourcing:
 ```bash
 echo "source ~/make_ai_robot/install/setup.bash" >> ~/.bashrc
 ```
+
+**⚠️ Important Reminder** 
+
+By default, ROS2 should be sourced first: `source /opt/ros/jazzy/setup.bash`
+
+Keep in mind that if you edited your code and use it, you need to rebuild and source `setup.bash`.
+
 
 ### Understanding the Workspace Structure
 
@@ -178,7 +193,7 @@ In Rviz, you can see colored 3D pointcloud from RGB-D camera and red 2D pointclo
 
 **Launch Arguments:**
 - `use_gt_pose` - Use Ground Truth (GT) pose of "trunk" link for localization (Data is from Gazebo)
-- `world_file_name:=<world_name>.world` - Choose world (hopital, empty, cafe, house) (Default: hospital)
+- `world_file_name:=<world_name>.world` - Choose world (hospital, empty, cafe, house) (Default: hospital)
 - `x:=0.0 y:=1.0 z:=0.5` - Initial robot position (meter) (Default: x=0.0, y=1.0, z=0.5)
 - `roll:=0.0 pitch:=0.0, yaw:=0.0` - Initial robot orientation (radian) (Default: roll=0.0, pitch=0.0, yaw=0.0)
 
@@ -189,18 +204,27 @@ ros2 launch go1_simulation go1.gazebo.launch.py use_gt_pose:=true world_file_nam
 
 **⚠️ Important Reminder** 
 
-Currently you are using ground truth pose of robot from simulator. But you should implement your own localization module without relying on GT. In the competition, it is not allowed to use any GT value. All the information should be from sensors (RGB-D Camera, LiDAR, IMU and map) and you should calculate what you want from it.
+If your computer does not have GPU, then simulation would be too slow, and this makes robot can not work. You should check Real Time Factor of Gazebo simulation. It should be at least 50%. 
 
-### 2: Visualize pre-built 2D occupancy grid map
+<img src="images/Gazebo_RTF.png" alt="Gazebo RTF" width="600"/>
 
-To visualize map in RViz:
+Launch file, by default, tries to use GPU. To check whether GPU is being used, run this code:
+```bash
+nvidia-smi
+```
+
+**Note:** Currently, you are using the ground truth pose of the robot from the simulator. However, you should implement your own localization module without relying on ground truth data. In the competition, it is not allowed to use any ground truth values. All information must come from sensors (RGB-D Camera, LiDAR, IMU, and map), and you need to estimate the robot's state from these sensors.
+
+### 2. Visualize pre-built 2D occupancy grid map
+
+To visualize the map in RViz:
 ```bash
 ros2 launch go1_simulation visualize_map.launch.py
 ```
 
 You should see the map in RViz:
 
-You can compare pointcloud and pre-built map
+You can compare the pointcloud and pre-built map
 
 <img src="images/start_rviz_2.png?v=1" alt="RViz Visualization 2" width="600"/>
 
@@ -258,11 +282,13 @@ ros2 launch path_tracker path_tracker_launch.py
 **Step 2**: Generate and follow a path to specific pose:
 
 ```bash
-# Move to position (x=2.0 meter, y=1.0 meter) with yaw=0 rad orientation
-ros2 run path_tracker move_robot.py 2.0 1.0 0.0
+# Move to position 
+# Run this code, wait a few seconds, and type (x y yaw)
+ros2 run path_tracker move_go1.py 
+# Enter desired 2D position: ex) 5 1 0
 ```
 
-**Step 3**: Check!:
+**Step 3**: Compare goal pose and real pose!:
 ```bash 
 # Read x, y, z, qx, qy, qz, qw and compare with your command
 # You need to convert the quaternion to a yaw angle
@@ -281,8 +307,9 @@ ros2 topic echo /go1_pose
 
 **⚠️ Important Reminder** 
 
-Current `move_robot.py` does not consider collision at all. You should implement your own path planner for collision avoidance. Planned path will be passed to `path_tracker_launch.py` and robot will follow that path.
-For the better path following, you can tune the parameters in `path_tracker/config/mppi.yaml`.
+Current `move_go1.py` does not consider collision at all. You should implement your own path planner for collision avoidance. Planned path will be passed to `path_tracker_launch.py` and robot will follow that path.
+
+Also, path tracking ability might be not that good. For the better path following, you can tune the parameters in `path_tracker/config/mppi.yaml`.
 
 ---
 
@@ -357,11 +384,11 @@ TBD - Do not change here yet
 
 ### Mission 1
 
-**Goal**: Find toilet in the map 
+**Goal**: Find the toilet in the map 
 
 **What you need to do**: 
 
-With undetermined natural command, navigate robot to the toilet. For this mission only, you can calculate position of toilet before the mission, and utilize it. For other mission, it is never allowed to use pre-calculated position or orientation. Also it is not allowed to use ground truth pose of objects in simulation.
+With an undetermined natural command, navigate the robot to the toilet. For this mission only, you can calculate the position of the toilet before the mission and utilize it. For other missions, it is never allowed to use pre-calculated positions or orientations. Also, it is not allowed to use ground truth pose of objects in simulation.
 
 
 <img src="images/mission_1.png" alt="Mission 1" width="600"/>
@@ -373,18 +400,18 @@ With undetermined natural command, navigate robot to the toilet. For this missio
 
 **What you need to do**: 
 
-With undetermined natural command, find something to eat and bark in front of it. The robot should distinguish good food and bad food. The food are placed somewhere in the map. Robot should explore the map, find the food, distinguish it is edible or not, and bark in front of it. 
+With an undetermined natural command, find something to eat and bark in front of it. The robot should distinguish between good food and bad food. The food items are placed somewhere in the map. The robot should explore the map, find the food, distinguish whether it is edible or not, and bark in front of it. 
 
-For `bark`, robot need to publish string message "bark" to `bark` topic 5 times when these conditions are satisfied:
-1. Food should be visible in RGB image of `camera_head` or `camera_top`.
+For `bark`, the robot needs to publish string message "bark" to the `bark` topic 5 times when these conditions are satisfied:
+1. Food should be visible in the RGB image of `camera_head` or `camera_top`.
 2. Food should be placed at the horizontal center of the image.
 3. Robot should be close enough to the food.
 
-These are food which will be used for the mission 2. 
+These are the food items which will be used for mission 2. 
 
-Left food are good food which is edible. Right ones are bad food.
+Left items are good food which is edible. Right items are bad food.
 
-**The position of food is not important.** (Good apple on the floor or on the sky is also edible.)
+**The position of food is not important.** (A good apple on the floor or in the sky is still edible.)
 
 <img src="images/mission_2_1.png" alt="Mission 2 1" width="600"/>
 
@@ -439,7 +466,7 @@ ros2 node info /path_tracker
 ROS2 typically requires multiple terminal windows. Here's a suggested workflow:
 
 1. **Terminal 1**: Launch Gazebo simulation
-2. **Terminal 2**: Run robot controller (`junior_ctrl`)If you move the robot,
+2. **Terminal 2**: Run robot controller (`junior_ctrl`)
 3. **Terminal 3**: Run additional nodes (keyboard control, path tracker, etc.)
 4. **Terminal 4**: Monitor topics and debugging
 

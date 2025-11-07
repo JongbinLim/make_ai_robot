@@ -51,6 +51,7 @@ def generate_launch_description():
     use_sim_time = LaunchConfiguration('use_sim_time')
     world_file_name = LaunchConfiguration('world_file_name')
     use_gt_pose = LaunchConfiguration('use_gt_pose')
+    use_gpu = LaunchConfiguration('use_gpu')
 
     # Set the pose configuration variables
     x = LaunchConfiguration('x')
@@ -80,6 +81,11 @@ def generate_launch_description():
         name='use_gt_pose',
         default_value='false',
         description='Flag to enable using GT pose for localization')
+
+    declare_use_gpu_cmd = DeclareLaunchArgument(
+        name='use_gpu',
+        default_value='true',
+        description='Flag to enable using GPU for rendering')
 
     # Pose arguments
     declare_x_cmd = DeclareLaunchArgument(
@@ -111,6 +117,26 @@ def generate_launch_description():
         name='yaw',
         default_value='0.0',
         description='yaw angle of initial orientation, radians')
+
+    # Set Gazebo to use GPU
+    # Force OpenGL to prefer the dedicated GPU
+    set_gpu_render_cmd = SetEnvironmentVariable(
+        name='MESA_DEDICATE_DEVICE_ID',
+        value='0', 
+        condition=IfCondition(use_gpu)
+    )
+
+    set_nv_offload_cmd = SetEnvironmentVariable(
+        name='__NV_PRIME_RENDER_OFFLOAD',
+        value='1',
+        condition=IfCondition(use_gpu)
+    )
+
+    set_glx_vendor_cmd = SetEnvironmentVariable(
+        name='__GLX_VENDOR_LIBRARY_NAME',
+        value='nvidia',
+        condition=IfCondition(use_gpu)
+    )
 
     # Set Gazebo resource path
     set_gz_resource_path = SetEnvironmentVariable(
@@ -206,6 +232,7 @@ def generate_launch_description():
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_world_file_name_cmd)
     ld.add_action(declare_use_gt_pose_cmd)
+    ld.add_action(declare_use_gpu_cmd)
 
     # Add pose arguments
     ld.add_action(declare_x_cmd)
@@ -216,6 +243,9 @@ def generate_launch_description():
     ld.add_action(declare_yaw_cmd)
 
     # Add the actions to the launch description
+    ld.add_action(set_gpu_render_cmd)
+    ld.add_action(set_nv_offload_cmd)
+    ld.add_action(set_glx_vendor_cmd)
     ld.add_action(set_gz_resource_path)
     ld.add_action(start_gazebo_world_cmd)
     ld.add_action(start_gazebo_ros_bridge_cmd)
