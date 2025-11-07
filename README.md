@@ -12,10 +12,11 @@ This repository is currently under active development and **frequent updates** m
 To ensure you are working with the **latest version** of this project, please run the following command in your terminal:
 
 ```bash
+git fetch origin
 git pull origin main
 ```
 
-**Note:** Be careful not to overwrite your local changes when pulling updates
+**Note:** Be careful not to overwrite your local changes when pulling updates. We recommend you to create new packages and work on them.
 
 ---
 
@@ -212,6 +213,8 @@ Launch file, by default, tries to use GPU. To check whether GPU is being used, r
 ```bash
 nvidia-smi
 ```
+
+If your computer performance is limited, try to use `empty.world` first.
 
 **Note:** Currently, you are using the ground truth pose of the robot from the simulator. However, you should implement your own localization module without relying on ground truth data. In the competition, it is not allowed to use any ground truth values. All information must come from sensors (RGB-D Camera, LiDAR, IMU, and map), and you need to estimate the robot's state from these sensors.
 
@@ -506,9 +509,14 @@ source ~/make_ai_robot/install/setup.bash
 
 ### Robot Doesn't Walk Well
 **Common causes:**
-1. Check Real Time Factor (RTF) of the simulation (right below of the GUI). It should be above 60% for normal operation.
-2. Check the frequency (Hz) of `/imu_plugin/out`. It should be above 500 Hz for normal operation.
-3. If you use a higher-performance computer, the problem might be solved.
+1. Check Real Time Factor (RTF) of the simulation (right below of the GUI) like below image. 
+2. It should be above 50% for normal operation. And you need to change parameters of `mppi.yaml` for better locomotion.
+3. Check the frequency (Hz) of `/imu_plugin/out`. It should be above 500 Hz for normal operation.
+4. If you use a higher-performance computer, the problem might be solved.
+
+
+<img src="images/Gazebo_RTF.png" alt="Gazebo RTF" width="600"/>
+
 
 ### Robot Doesn't Move
 **Common causes:**
