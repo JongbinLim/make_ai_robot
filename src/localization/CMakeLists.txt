@@ -21,6 +21,7 @@ install(
     localization/utils.py
     localization/global_localizer_node.py
     localization/particle_filter.py
+    localization/particle_filter_unoptimized.py
   DESTINATION lib/${PROJECT_NAME}
 )
 

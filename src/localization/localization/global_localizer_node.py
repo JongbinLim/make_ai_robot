@@ -20,6 +20,7 @@ Flow:
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
+from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
 from rclpy.duration import Duration
 
 from geometry_msgs.msg import TransformStamped, PoseWithCovarianceStamped, PoseArray, Pose, PoseStamped
@@ -60,7 +61,7 @@ class GlobalLocalizerNode(Node):
         self.pf = ParticleFilter(
             min_particles=self.get_parameter('min_particles').value,
             max_particles=self.get_parameter('max_particles').value,
-            initial_noise=[0.1, 0.1, 0.1]  # x, y, yaw noise
+            initial_noise=[0.3, 0.3, 0.3]  # x, y, yaw noise
         )
         # 초기 파티클 생성
         self.pf.initialize(self.init_x, self.init_y, init_yaw)
@@ -69,17 +70,28 @@ class GlobalLocalizerNode(Node):
         self.last_odom_matrix = None
         self.last_scan_time = None
 
+        # 성능 모니터링 변수
+        self.debug_last_time = self.get_clock().now()
+        self.debug_frame_count = 0
+
         # TF Setup
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.tf_broadcaster = TransformBroadcaster(self)
+
+        # Map Subscription 부분 수정
+        map_qos = QoSProfile(
+            depth=1,
+            reliability=ReliabilityPolicy.RELIABLE,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL  # 이 부분이 중요합니다!
+        )
 
         # Map Subscription
         self.map_sub = self.create_subscription(
             OccupancyGrid,
             '/map',
             self.map_callback,
-            rclpy.qos.qos_profile_sensor_data
+            map_qos
         )
 
         # Initial Pose Subscription (RViz "2D Pose Estimate")
@@ -126,7 +138,7 @@ class GlobalLocalizerNode(Node):
         try:
             # 1. 정확한 시간 시도 (timeout 인자는 rclpy 버전에 따라 다를 수 있음, 보통 loop 내에서 체크)
             # 하지만 blocking을 피하기 위해 예외 처리 방식으로 접근합니다.
-            trans = self.tf_buffer.lookup_transform('odom', 'base', time)
+            trans = self.tf_buffer.lookup_transform('odom', 'base', time, timeout=Duration(seconds=0.1))
             return transform_to_matrix(trans.transform)
         except (LookupException, ConnectivityException, ExtrapolationException):
             try:
@@ -177,7 +189,7 @@ class GlobalLocalizerNode(Node):
             _, _, dyaw = tf_transformations.euler_from_matrix(T_delta)
 
             # 이동량이 매우 작으면 필터 업데이트 스킵
-            if abs(dx) < 0.001 and abs(dy) < 0.001 and abs(dyaw) < 0.001:
+            if abs(dx) < 0.01 and abs(dy) < 0.01 and abs(dyaw) < 0.01:
                 return  # 업데이트 하지 않음
 
             # 파티클 필터 예측 단계 실행
@@ -192,7 +204,7 @@ class GlobalLocalizerNode(Node):
             scan_msg.ranges,
             scan_msg.angle_min,
             scan_msg.angle_increment,
-            sensor_offset=[0.0, 0.0]  # base_link와 laser_link가 일치한다고 가정. 다르면 TF로 오프셋 계산 필요.
+            sensor_offset=[0.0, 0.0]  # base_link와 laser_link가 일치한다고 가정. 파일을 뜯어보니 일치가 맞음
         )
 
         # 4. Get Estimated Pose (Map -> Base)
@@ -215,12 +227,27 @@ class GlobalLocalizerNode(Node):
         # T_map_to_odom 계산
         T_map_to_odom = T_map_to_base @ T_base_to_odom
 
-        # 6. Publish Map -> Odom TF
+        # Publish Map -> Odom TF
         self.publish_tf(T_map_to_odom, scan_msg.header.stamp)
 
-        # 7. Publish Visualization
+        # Publish Visualization
         self.publish_mcl_pose(estimated_pose, scan_msg.header.stamp)
         self.publish_particles(scan_msg.header.stamp)
+
+        # Hz 및 파티클 수 모니터링
+        self.debug_frame_count += 1
+        now = self.get_clock().now()
+        dt_nanos = (now - self.debug_last_time).nanoseconds
+
+        # 1초(1e9 나노초)마다 로그 출력
+        if dt_nanos >= 1e9:
+            hz = self.debug_frame_count / (dt_nanos / 1e9)
+            num_particles = len(self.pf.particles)
+            self.get_logger().info(f"⚡ MCL Status | Rate: {hz:.2f} Hz | Particles: {num_particles}")
+
+            # 변수 초기화
+            self.debug_frame_count = 0
+            self.debug_last_time = now
 
     def publish_tf(self, T, stamp):
         t = TransformStamped()
@@ -246,21 +273,18 @@ class GlobalLocalizerNode(Node):
         msg.header.stamp = stamp
         msg.header.frame_id = 'map'
 
-        msg.pose.pose.position.x = float(pose_2d[0])
-        msg.pose.pose.position.y = float(pose_2d[1])
-        msg.pose.pose.position.z = self.init_z # Go1은 평지 보행 가정 시 z값 고정 혹은 IMU/Odom에서 가져와야 함. 일단 초기값 사용.
+        msg.pose.position.x = float(pose_2d[0])
+        msg.pose.position.y = float(pose_2d[1])
+        msg.pose.position.z = self.init_z
 
         # 2D PF는 yaw만 추정하므로, roll/pitch는 0 혹은 IMU 값 사용해야 함.
         # 지침상 단순화를 위해 0 혹은 초기값 유지.
         q = tf_transformations.quaternion_from_euler(0, 0, float(pose_2d[2]))
 
-        msg.pose.pose.orientation.x = q[0]
-        msg.pose.pose.orientation.y = q[1]
-        msg.pose.pose.orientation.z = q[2]
-        msg.pose.pose.orientation.w = q[3]
-
-        # Covariance는 계산되지 않았으므로 대략적인 값 혹은 0으로 둠
-        msg.pose.covariance = [0.0] * 36
+        msg.pose.orientation.x = q[0]
+        msg.pose.orientation.y = q[1]
+        msg.pose.orientation.z = q[2]
+        msg.pose.orientation.w = q[3]
 
         self.pose_pub.publish(msg)
 
@@ -273,7 +297,7 @@ class GlobalLocalizerNode(Node):
         # Numba 배열이므로 numpy로 처리
         particles = self.pf.particles
         # 시각화 부하를 줄이기 위해 최대 100개 정도만 퍼블리시 하거나 전체를 퍼블리시
-        step = max(1, len(particles) // 100)
+        step = max(1, len(particles) // 10)
 
         for p in particles[::step]:
             pose = Pose()
