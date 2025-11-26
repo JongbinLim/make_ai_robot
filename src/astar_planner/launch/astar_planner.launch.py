@@ -50,7 +50,7 @@ def generate_launch_description():
     
     obstacle_margin_arg = DeclareLaunchArgument(
         'obstacle_margin',
-        default_value='1.0',
+        default_value='1.5',
         description='Safety margin around obstacles in meters'
     )
 
