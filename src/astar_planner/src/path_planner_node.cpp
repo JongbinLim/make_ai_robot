@@ -1,8 +1,11 @@
+// astar_planner/src/path_planner_node.cpp
+
 #include <memory>
 #include <vector>
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <utility>  // std::pair
 
 #include "rclcpp/rclcpp.hpp"
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
@@ -18,6 +21,71 @@
 
 using namespace std::chrono_literals;
 
+// ======================
+// Catmull–Rom Spline helper (전역 helper 함수)
+// ======================
+namespace
+{
+
+std::pair<double, double> catmullRomPoint(
+    const std::pair<double,double>& p0,
+    const std::pair<double,double>& p1,
+    const std::pair<double,double>& p2,
+    const std::pair<double,double>& p3,
+    double t)
+{
+  double t2 = t * t;
+  double t3 = t2 * t;
+
+  double x = 0.5 * (2 * p1.first +
+      (-p0.first + p2.first) * t +
+      (2 * p0.first - 5 * p1.first + 4 * p2.first - p3.first) * t2 +
+      (-p0.first + 3 * p1.first - 3 * p2.first + p3.first) * t3);
+
+  double y = 0.5 * (2 * p1.second +
+      (-p0.second + p2.second) * t +
+      (2 * p0.second - 5 * p1.second + 4 * p2.second - p3.second) * t2 +
+      (-p0.second + 3 * p1.second - 3 * p2.second + p3.second) * t3);
+
+  return {x, y};
+}
+
+// pts: world 좌표 (x,y) 리스트
+// 반환: Catmull–Rom으로 보간한 더 촘촘한 경로
+std::vector<std::pair<double,double>>
+smoothPathCatmullRom(const std::vector<std::pair<double,double>>& pts)
+{
+  std::vector<std::pair<double,double>> smooth;
+
+  if (pts.size() < 4) {
+    return pts;  // 점이 4개 미만이면 그대로 반환
+  }
+
+  // 구간마다 보간
+  for (size_t i = 0; i + 3 < pts.size(); ++i) {
+    const auto& p0 = pts[i];
+    const auto& p1 = pts[i+1];
+    const auto& p2 = pts[i+2];
+    const auto& p3 = pts[i+3];
+
+    // t step: 곡선 해상도 (0.05면 구간당 20개 샘플)
+    for (double t = 0.0; t <= 1.0; t += 0.05) {
+      smooth.push_back(catmullRomPoint(p0, p1, p2, p3, t));
+    }
+  }
+
+  // 마지막 점을 확실히 포함
+  smooth.push_back(pts.back());
+
+  return smooth;
+}
+
+} // namespace
+
+// ======================
+// PathPlannerNode 정의
+// ======================
+
 class PathPlannerNode : public rclcpp::Node
 {
 public:
@@ -27,7 +95,7 @@ public:
     // Declare parameters
     this->declare_parameter<double>("resolution", 1.0);
     // 장애물 주변 margin [m] (soft cost 영역)
-    this->declare_parameter<double>("obstacle_margin", 1.5);
+    this->declare_parameter<double>("obstacle_margin", 0.3);
 
     resolution_ = this->get_parameter("resolution").as_double();
     obstacle_margin_m_ = this->get_parameter("obstacle_margin").as_double();
@@ -43,8 +111,10 @@ public:
     goal_reached_ = false;
 
     // Subscribers
+    auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
+
     map_sub_ = this->create_subscription<nav_msgs::msg::OccupancyGrid>(
-      "/map", 10,
+      "/map", map_qos,
       std::bind(&PathPlannerNode::mapCallback, this, std::placeholders::_1));
 
     current_pose_sub_ = this->create_subscription<geometry_msgs::msg::PoseStamped>(
@@ -197,38 +267,51 @@ private:
       return;
     }
 
-    // Convert grid path to ROS Path message
+    // Grid path → world 좌표 리스트로 변환
+    std::vector<std::pair<double,double>> world_path;
+    world_path.reserve(path_cells.size());
+
+    for (const auto & cell : path_cells) {
+      auto wp = gridToWorld(cell.x, cell.y);
+      world_path.push_back(wp);
+    }
+
+    // Catmull–Rom spline smoothing 적용
+    std::vector<std::pair<double,double>> smooth_world_path;
+    if (world_path.size() >= 4) {
+      smooth_world_path = smoothPathCatmullRom(world_path);
+    } else {
+      smooth_world_path = world_path;
+    }
+
+    // Convert to ROS Path message
     nav_msgs::msg::Path path_msg;
     path_msg.header.stamp = this->now();
     path_msg.header.frame_id = "map";
 
-    // First waypoint is always current pose
+    // First waypoint: 현재 로봇 pose
     geometry_msgs::msg::PoseStamped first_pose;
-    first_pose.header.stamp = this->now();
-    first_pose.header.frame_id = "map";
+    first_pose.header = path_msg.header;
     first_pose.pose = current_pose_.pose;
     path_msg.poses.push_back(first_pose);
 
-    // Add rest of the path (skip first cell if it's same as current position)
-    for (size_t i = 0; i < path_cells.size(); ++i) {
-      const auto & cell = path_cells[i];
+    // 나머지 경로 점들을 Pose로 추가
+    geometry_msgs::msg::PoseStamped pose;
+    for (size_t i = 0; i < smooth_world_path.size(); ++i) {
+      double wx = smooth_world_path[i].first;
+      double wy = smooth_world_path[i].second;
 
-      auto world_pos = gridToWorld(cell.x, cell.y);
-
-      // Skip if this waypoint is too close to current position
-      double dx = world_pos.first - current_pose_.pose.position.x;
-      double dy = world_pos.second - current_pose_.pose.position.y;
+      // 첫 점이 현재 위치와 너무 가까우면 생략
+      double dx = wx - current_pose_.pose.position.x;
+      double dy = wy - current_pose_.pose.position.y;
       double dist = std::sqrt(dx * dx + dy * dy);
-
-      if (i == 0 && dist < 0.3) {
-        continue;  // Skip first cell if robot is already there
+      if (i == 0 && dist < 0.1) {
+        continue;
       }
 
-      geometry_msgs::msg::PoseStamped pose;
-      pose.header.stamp = this->now();
-      pose.header.frame_id = "map";
-      pose.pose.position.x = world_pos.first;
-      pose.pose.position.y = world_pos.second;
+      pose.header = path_msg.header;
+      pose.pose.position.x = wx;
+      pose.pose.position.y = wy;
       pose.pose.position.z = 0.0;
       pose.pose.orientation.w = 1.0;
 
@@ -237,14 +320,16 @@ private:
 
     path_pub_->publish(path_msg);
 
-    // Publish visualization markers
-    publishPathMarkers(path_cells);
+    // Publish visualization markers (smooth path 기준)
+    publishPathMarkers(smooth_world_path);
 
     // Only log if path length changed significantly or first time
     static size_t last_path_size = 0;
-    if (last_path_size == 0 || std::abs((int)path_cells.size() - (int)last_path_size) > 3) {
-      RCLCPP_INFO(this->get_logger(), "Path updated: %zu waypoints", path_cells.size());
-      last_path_size = path_cells.size();
+    if (last_path_size == 0 ||
+        std::abs((int)smooth_world_path.size() - (int)last_path_size) > 3) {
+      RCLCPP_INFO(this->get_logger(), "Path updated: %zu waypoints (smoothed)",
+        smooth_world_path.size());
+      last_path_size = smooth_world_path.size();
     }
   }
 
@@ -278,7 +363,7 @@ private:
 
   // ====== Visualization ======
 
-  void publishPathMarkers(const std::vector<astar_planner::GridCell> & path)
+  void publishPathMarkers(const std::vector<std::pair<double,double>> & path_world)
   {
     visualization_msgs::msg::MarkerArray marker_array;
 
@@ -295,11 +380,10 @@ private:
     line_marker.color.b = 0.0;
     line_marker.color.a = 1.0;
 
-    for (const auto & cell : path) {
+    for (const auto & wp : path_world) {
       geometry_msgs::msg::Point p;
-      auto world_pos = gridToWorld(cell.x, cell.y);
-      p.x = world_pos.first;
-      p.y = world_pos.second;
+      p.x = wp.first;
+      p.y = wp.second;
       p.z = 0.1;
       line_marker.points.push_back(p);
     }
@@ -377,7 +461,7 @@ private:
     double map_resolution = map_msg_->info.resolution;
 
     if (width <= 0 || height <= 0 || map_resolution <= 0.0) {
-      // fallback: 그냥 raw 맵을 0/2로만 써도 되지만, 여기선 안전하게 종료
+      // fallback: 안전하게 종료
       return;
     }
 

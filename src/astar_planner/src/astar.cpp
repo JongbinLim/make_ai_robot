@@ -1,14 +1,19 @@
 #include "astar_planner/astar.hpp"
+
 #include <iostream>
 #include <limits>
 #include <cmath>
 #include <algorithm>
+#include <queue>
 
 namespace astar_planner
 {
 
 AStar::AStar()
-: map_width_(0), map_height_(0)
+: map_width_(0),
+  map_height_(0),
+  max_penalty_(20.0),              // 장애물 바로 옆 penalty
+  max_influence_dist_cells_(8.0)   // 장애물에서 8셀까지 penalty 영향
 {
 }
 
@@ -16,7 +21,7 @@ AStar::~AStar()
 {
 }
 
-void AStar::setMap(const std::vector<std::vector<int>>& map)
+void AStar::setMap(const std::vector<std::vector<int>> & map)
 {
   // map 값 의미:
   // 0 = free
@@ -24,15 +29,65 @@ void AStar::setMap(const std::vector<std::vector<int>>& map)
   // 2 = real obstacle (통과 불가)
   map_ = map;
   if (!map_.empty()) {
-    map_height_ = map_.size();
-    map_width_ = map_[0].size();
+    map_height_ = static_cast<int>(map_.size());
+    map_width_ = static_cast<int>(map_[0].size());
   } else {
     map_height_ = 0;
     map_width_ = 0;
   }
+
+  // ---------- 장애물까지 거리 맵(distance field) 계산 ----------
+  const double INF = std::numeric_limits<double>::infinity();
+  distance_map_.assign(
+    map_height_, std::vector<double>(map_width_, INF));
+
+  std::queue<GridCell> q;
+
+  // 1) real obstacle(값=2)인 셀들을 seed로 넣고 거리 0으로 초기화
+  for (int y = 0; y < map_height_; ++y) {
+    for (int x = 0; x < map_width_; ++x) {
+      if (map_[y][x] == 2) {  // real obstacle
+        distance_map_[y][x] = 0.0;
+        q.push(GridCell{x, y});
+      }
+    }
+  }
+
+  // 2) 4-connected BFS 로 각 셀까지의 "장애물까지 최소 거리(셀)" 계산
+  const std::vector<std::pair<int, int>> dirs = {
+    {1, 0}, {-1, 0}, {0, 1}, {0, -1}
+  };
+
+  while (!q.empty()) {
+    GridCell cur = q.front();
+    q.pop();
+    double cur_dist = distance_map_[cur.y][cur.x];
+
+    for (const auto & d : dirs) {
+      int nx = cur.x + d.first;
+      int ny = cur.y + d.second;
+      if (nx < 0 || nx >= map_width_ || ny < 0 || ny >= map_height_) {
+        continue;
+      }
+
+      // 장애물 셀은 0으로 유지
+      if (map_[ny][nx] == 2) {
+        continue;
+      }
+
+      double nd = cur_dist + 1.0;  // 한 칸 멀어질 때마다 +1 셀
+      if (nd < distance_map_[ny][nx]) {
+        distance_map_[ny][nx] = nd;
+        q.push(GridCell{nx, ny});
+      }
+    }
+  }
+
+  // 이제 distance_map_[y][x]에는
+  // "가장 가까운 real obstacle까지의 거리(셀)" 이 들어 있음
 }
 
-double AStar::calculateHeuristic(const GridCell& a, const GridCell& b) const
+double AStar::calculateHeuristic(const GridCell & a, const GridCell & b) const
 {
   // Euclidean distance
   double dx = static_cast<double>(a.x - b.x);
@@ -40,7 +95,7 @@ double AStar::calculateHeuristic(const GridCell& a, const GridCell& b) const
   return std::sqrt(dx * dx + dy * dy);
 }
 
-bool AStar::isValid(const GridCell& cell) const
+bool AStar::isValid(const GridCell & cell) const
 {
   if (cell.x < 0 || cell.x >= map_width_ || cell.y < 0 || cell.y >= map_height_) {
     return false;
@@ -50,11 +105,11 @@ bool AStar::isValid(const GridCell& cell) const
   return v != 2;
 }
 
-std::vector<GridCell> AStar::getNeighbors(const GridCell& cell) const
+std::vector<GridCell> AStar::getNeighbors(const GridCell & cell) const
 {
   std::vector<GridCell> neighbors;
 
-  // 8-connected grid: up, down, left, right, and 4 diagonals
+  // 8-connected grid: 상하좌우 + 대각선
   std::vector<std::pair<int, int>> directions = {
     {0, 1},   // up
     {0, -1},  // down
@@ -66,8 +121,8 @@ std::vector<GridCell> AStar::getNeighbors(const GridCell& cell) const
     {-1, -1}  // down-left
   };
 
-  for (const auto& dir : directions) {
-    GridCell neighbor = {cell.x + dir.first, cell.y + dir.second};
+  for (const auto & dir : directions) {
+    GridCell neighbor{cell.x + dir.first, cell.y + dir.second};
     if (isValid(neighbor)) {
       neighbors.push_back(neighbor);
     }
@@ -77,9 +132,9 @@ std::vector<GridCell> AStar::getNeighbors(const GridCell& cell) const
 }
 
 std::vector<GridCell> AStar::reconstructPath(
-  const std::unordered_map<GridCell, GridCell, GridCellHash>& came_from,
-  const GridCell& start,
-  const GridCell& goal) const
+  const std::unordered_map<GridCell, GridCell, GridCellHash> & came_from,
+  const GridCell & start,
+  const GridCell & goal) const
 {
   std::vector<GridCell> path;
   GridCell current = goal;
@@ -99,11 +154,11 @@ std::vector<GridCell> AStar::reconstructPath(
   return path;
 }
 
-std::vector<GridCell> AStar::findPath(const GridCell& start, const GridCell& goal)
+std::vector<GridCell> AStar::findPath(const GridCell & start, const GridCell & goal)
 {
   std::vector<GridCell> empty_path;
 
-  // Check if start and goal are valid (real obstacle 위에 있으면 안 됨)
+  // Start / Goal 이 real obstacle 위면 바로 실패
   if (!isValid(start)) {
     std::cerr << "Start position is invalid or occupied!" << std::endl;
     return empty_path;
@@ -117,13 +172,13 @@ std::vector<GridCell> AStar::findPath(const GridCell& start, const GridCell& goa
   // Priority queue for open set
   std::priority_queue<Node, std::vector<Node>, std::greater<Node>> open_set;
 
-  // Track visited nodes
+  // Closed set
   std::unordered_map<GridCell, bool, GridCellHash> closed_set;
 
-  // Track g_cost for each node
+  // g_score
   std::unordered_map<GridCell, double, GridCellHash> g_score;
 
-  // Track parent of each node
+  // Parent (for path reconstruction)
   std::unordered_map<GridCell, GridCell, GridCellHash> came_from;
 
   // Initialize start node
@@ -137,53 +192,59 @@ std::vector<GridCell> AStar::findPath(const GridCell& start, const GridCell& goa
   open_set.push(start_node);
   g_score[start] = 0.0;
 
-  // margin penalty (soft cost): margin 셀을 지날 때 추가로 더해줄 비용
-  const double margin_penalty = 2.0;  // 필요하면 나중에 튜닝 가능
-
   while (!open_set.empty()) {
-    // Get node with lowest f_cost
     Node current = open_set.top();
     open_set.pop();
 
-    // Check if we reached the goal
+    // Goal 도달
     if (current.cell == goal) {
       return reconstructPath(came_from, start, goal);
     }
 
-    // Skip if already processed
+    // 이미 처리한 노드면 스킵
     if (closed_set[current.cell]) {
       continue;
     }
 
     closed_set[current.cell] = true;
 
-    // Check all neighbors
+    // 이웃 탐색
     std::vector<GridCell> neighbors = getNeighbors(current.cell);
 
-    for (const auto& neighbor : neighbors) {
-      // Skip if already processed
+    for (const auto & neighbor : neighbors) {
       if (closed_set[neighbor]) {
         continue;
       }
 
-      // Calculate movement cost (1 for straight, sqrt(2) for diagonal)
       double dx = static_cast<double>(neighbor.x - current.cell.x);
       double dy = static_cast<double>(neighbor.y - current.cell.y);
       double movement_cost = std::sqrt(dx * dx + dy * dy);
 
-      // margin 구역 penalty 추가
+      // ---- 거리 기반 penalty 계산 ----
       double penalty = 0.0;
-      int cell_value = map_[neighbor.y][neighbor.x];
-      if (cell_value == 1) {
-        penalty = margin_penalty;
+      double dist_cells = std::numeric_limits<double>::infinity();
+
+      if (!distance_map_.empty()) {
+        dist_cells = distance_map_[neighbor.y][neighbor.x];
+      }
+
+      if (std::isfinite(dist_cells)) {
+        // 장애물에서 max_influence_dist_cells_ 셀 이내만 penalty 적용
+        if (dist_cells < max_influence_dist_cells_) {
+          // dist = 0일 때 max_penalty_,
+          // dist = max_influence_dist_cells_ 일 때 0 이 되도록 선형 스케일
+          double w = (max_influence_dist_cells_ - dist_cells) / max_influence_dist_cells_;
+          if (w < 0.0) {
+            w = 0.0;
+          }
+          penalty = max_penalty_ * w;
+        }
       }
 
       double tentative_g = current.g_cost + movement_cost + penalty;
 
-      // Check if this path is better
       auto it = g_score.find(neighbor);
       if (it == g_score.end() || tentative_g < it->second) {
-        // This path is better, record it
         came_from[neighbor] = current.cell;
         g_score[neighbor] = tentative_g;
 
