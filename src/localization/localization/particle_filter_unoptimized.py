@@ -20,29 +20,25 @@ class ParticleFilter:
         # 노이즈 파라미터
         self.initial_noise = np.array(initial_noise, dtype=np.float32)
         # [x, y, yaw]에 대한 모션 노이즈 (튜닝 필요)
-        self.motion_noise = np.array([0.02, 0.02, 0.01], dtype=np.float32)
-        # 원래 0.01 0.01 0.01
+        self.motion_noise = np.array([0.05, 0.05, 0.1], dtype=np.float32)
+
         # 센서 모델 파라미터
-        self.sensor_sigma = 0.1 # 가우시안 분포의 표준편차 (m)
+        self.sensor_sigma = 0.3 # 가우시안 분포의 표준편차 (m)
         # Log 계산을 피하기 위해 미리 상수 계산
         self.sensor_model_factor = -0.5 / (self.sensor_sigma ** 2)
 
-        # KLD 파라미터
-        self.kld_err = 0.05 # 오차 허용 범위. 값이 작을수록 정밀해지고 파티클이 많아짐
-        self.kld_z = 2.32  # 위에서 설정한 오차범위 안에 실제 분포가 들어올 확률 (z_0.99의 값을 사용). 클수록 안정적이게 되지만 계산량이 늘어남
+        # 동적 장애물 필터링 파라미터
+        # 지도상의 벽과 센서 끝점의 거리가 이 값 이상이면 동적 장애물로 간주하고 무시
+        self.dist_threshold = 0.5
 
-        # Augmented MCL 파라미터
-        # w_avg: 현재 센서 측정값의 평균 우도
-        # w_slow: 장기 평균 우도 (느리게 변함)
-        # w_fast: 단기 평균 우도 (빠르게 변함)
-        self.w_slow = 0.0
-        self.w_fast = 0.0
-        self.alpha_slow = 0.001  # 감쇠율 (0 < alpha < 1)
-        self.alpha_fast = 0.1
-        # --------------------------------
+        # KLD 파라미터
+        self.kld_err = 0.02 # 오차 허용 범위. 값이 작을수록 정밀해지고 파티클이 많아짐
+        self.kld_z = 2.326  # 위에서 설정한 오차범위 안에 실제 분포가 들어올 확률 (z_0.99의 값을 사용). 클수록 안정적이게 되지만 계산량이 늘어남
 
         # 맵 데이터 저장 변수
         self.log_likelihood_map_flat = None # 최적화를 위해 확률 맵 대신 Log-Likelihood 맵을 저장
+        self.dist_map_flat = None  # 원본 거리 맵 저장 변수
+
         self.map_info = None
         self.map_resolution = 0.05
         self.map_origin = np.array([0, 0], dtype=np.float32)
@@ -67,7 +63,7 @@ class ParticleFilter:
         self.full_cos_cache = None
 
         # 레이다 데이터 다운 샘플링 변수. 높을수록 빨라짐
-        self.scan_step = 5
+        self.scan_step = 1
 
     def initialize(self, x, y, yaw):
         """초기 위치(x, y, yaw) 주변에 파티클을 가우시안 분포로 뿌립니다."""
@@ -80,10 +76,6 @@ class ParticleFilter:
 
         self._normalize_angles()
         self.weights = np.ones(self.num_particles) / self.num_particles
-
-        # Augmented MCL 변수 초기화
-        self.w_slow = 0.0
-        self.w_fast = 0.0
 
     def set_map(self, msg):
         """
@@ -129,13 +121,19 @@ class ParticleFilter:
 
         # 맵 밖이나 장애물 내부의 최대 페널티 설정 (log(prob) 값이므로 음수)
         # 너무 작은 값을 주면 underflow가 나므로 적절히 작은 값 설정
-        min_log_prob = -20.0  # e^-20 ~= 2e-9
+        min_log_prob = -10.0  # e^-20 ~= 2e-9
         log_likelihood_map = np.maximum(log_likelihood_map, min_log_prob)
 
         # 맵 밖 참조를 위한 패딩 전략
         # 맵 데이터 끝에 'min_log_prob' 값을 하나 추가.
         # 인덱스가 맵 밖을 벗어나면, 이 마지막 인덱스를 가리키게 됨
         self.log_likelihood_map_flat = np.append(log_likelihood_map.ravel(), min_log_prob).astype(np.float32)
+
+        # 동적 장애물 판별을 위해 원본 거리 맵(Distance Map)도 평탄화하여 저장
+        # 맵 밖(인덱스 오버플로우)은 거리가 0인 것으로 처리하거나 아주 큰 값으로 처리해야 함.
+        # 여기서는 동적 장애물 로직(dist > 3.0)에 걸리지 않도록 0.0(벽)으로 처리하여 안전하게 페널티를 받도록 유도
+        self.dist_map_flat = np.append(dist_map_meters.ravel(), 0.0).astype(np.float32)
+
         self.penalty_idx = self.map_size  # 마지막 인덱스 번호
 
 
@@ -183,40 +181,53 @@ class ParticleFilter:
         self.full_cos_cache = np.cos(angles)
         self.full_sin_cache = np.sin(angles)
 
-    def _generate_random_particles(self, n_particles):
+    def _recover_from_kidnapping(self):
         """
-        빈 공간(Free Space)에서 n_particles 개수만큼 랜덤 파티클을 생성하여 반환합니다.
-        (Augmented MCL 리샘플링 시 사용)
+        [수정됨] 부분적 복구 전략 (Partial Recovery)
+        위치를 완전히 잃었다고 판단될 때, 현재 추정값 주변을 일부 남기고
+        나머지는 전역에 랜덤하게 뿌립니다.
         """
-        if self.free_space_indices is None or n_particles <= 0:
-            return np.zeros((0, 3), dtype=np.float32)
+        # 맵 빈 공간 데이터가 없으면 리턴
+        if self.free_space_indices is None:
+            return
 
+        print("WARN: Low probability detected. Injecting random particles.")
+
+        # 1. 상위 30% 파티클은 유지 (또는 현재 베스트 위치 주변에 생성)
+        keep_ratio = 0.3
+        n_keep = int(self.num_particles * keep_ratio)
+        n_random = self.num_particles - n_keep
+
+        # 현재 가중치 기준으로 정렬하여 상위 n_keep개만 보존
+        # (혹은 단순히 현재 파티클을 유지하고 랜덤만 섞어도 됨. 여기서는 보존 전략 사용)
+        sorted_indices = np.argsort(self.weights)[::-1]
+        keep_indices = sorted_indices[:n_keep]
+
+        # 버퍼 앞쪽에 보존할 파티클 복사
+        self.particles[:n_keep] = self.particles[keep_indices]
+
+        # 2. 나머지(n_random)는 맵 전체 랜덤 생성
         num_free_cells = self.free_space_indices.shape[0]
-        rand_indices = np.random.choice(num_free_cells, size=n_particles)
+        rand_indices = np.random.choice(num_free_cells, size=n_random)
         chosen_cells = self.free_space_indices[rand_indices]
 
-        # 픽셀 좌표 -> 월드 좌표
         x_coords = chosen_cells[:, 0] * self.map_resolution + self.map_origin[0]
         y_coords = chosen_cells[:, 1] * self.map_resolution + self.map_origin[1]
 
-        # 그리드 내 랜덤 위치 미세 조정
-        x_coords += np.random.uniform(0, self.map_resolution, n_particles)
-        y_coords += np.random.uniform(0, self.map_resolution, n_particles)
-        yaw_angles = np.random.uniform(-np.pi, np.pi, n_particles)
+        # 랜덤 노이즈 추가
+        x_coords += np.random.uniform(0, self.map_resolution, n_random)
+        y_coords += np.random.uniform(0, self.map_resolution, n_random)
 
-        return np.column_stack((x_coords, y_coords, yaw_angles)).astype(np.float32)
+        # 파티클 배열 업데이트
+        self.particles[n_keep:, 0] = x_coords
+        self.particles[n_keep:, 1] = y_coords
+        self.particles[n_keep:, 2] = np.random.uniform(-np.pi, np.pi, n_random)
 
-    def _recover_from_kidnapping(self):
-        """
-        모든 파티클이 소실되었을 때 전체를 랜덤 파티클로 교체 (Hard Reset)
-        """
-        random_particles = self._generate_random_particles(self.num_particles)
-        if len(random_particles) > 0:
-            self.particles[:] = random_particles
-            self.weights = np.ones(self.num_particles) / self.num_particles
-        else:
-            # 맵 정보가 없으면 초기화
-            self.weights = np.ones(self.num_particles) / self.num_particles
+        # 3. 가중치 초기화 (매우 중요)
+        # 새로 생긴 랜덤 파티클에게 기회를 주기 위해 가중치를 평탄화하되,
+        # 기존 파티클이 너무 죽지 않도록 약간의 바이어스를 줄 수도 있음.
+        # 여기서는 전체 균등 초기화로 리셋.
+        self.weights = np.ones(self.num_particles) / self.num_particles
 
     def update(self, scan_ranges, scan_angle_min, scan_angle_inc, sensor_offset=[0.0, 0.0]):
         """
@@ -242,7 +253,7 @@ class ParticleFilter:
         raw_ranges = np.array(scan_ranges[::step], dtype=np.float32)
 
         # 유효한 거리 값만 골라내기
-        valid_mask = (raw_ranges > 0.1) & (raw_ranges < 10.0)
+        valid_mask = (raw_ranges > 0.01) & (raw_ranges < 20.0)
         ranges = raw_ranges[valid_mask]
 
         # 유효한 센서 데이터가 하나도 없으면 업데이트 스킵
@@ -289,36 +300,48 @@ class ParticleFilter:
 
         # Log-Likelihood Lookup
         # log_scores shape: (N, R)
+        # [수정됨] Log-Likelihood Lookup
         log_scores_per_ray = self.log_likelihood_map_flat[flat_indices]
-        # 파티클별 총 Log Score 합산 (곱셈 -> 덧셈)
-        total_log_scores = np.sum(log_scores_per_ray, axis=1)
 
+        # [중요] 동적 장애물 로직 단순화 (Robust Likelihood)
+        # 1. 센서가 맵 상의 벽보다 훨씬 먼 곳을 찍었거나 (유리창 등)
+        # 2. 센서가 맵 상의 벽보다 훨씬 가까운 곳을 찍었을 때 (사람 등)
+        # 점수가 -무한대로 가는 것을 막기 위해 하한선(min_log_prob)만 확실히 적용합니다.
+        # set_map에서 이미 min_log_prob 처리를 했지만, 안전을 위해 여기서 한 번 더 클리핑해도 좋습니다.
+
+        # 기존의 복잡한 saturation_score 로직 삭제하고 아래 한 줄로 대체 가능
+        # (이미 set_map에서 계산된 log_likelihood_map에 min_log_prob가 적용되어 있다면 생략 가능)
+
+        # 만약 동적 장애물(사람)을 명시적으로 무시하고 싶다면:
+        # "지도상의 거리(dist_map)가 큰데 센서값이 찍힌 경우"만 페널티를 줄여줍니다.
+
+        dist_vals_per_ray = self.dist_map_flat[flat_indices]
+
+        # 센서가 감지한 곳이 벽에서 0.5m 이상 떨어져 있다면 -> 동적 장애물일 확률 높음
+        # 이 경우, 이 레이(ray)의 점수를 '최악(-20)' 대신 '보통(-2.0)' 정도로 처리하여
+        # 파티클이 죽는 것을 방지합니다.
+        is_dynamic = dist_vals_per_ray > self.dist_threshold
+
+        # 동적 장애물이라고 판단되면 페널티를 완화 (예: 확률 0.13 정도에 해당하는 -2.0)
+        # 단, 이 값이 너무 크면(0에 가까우면) 벽이 없는 허공에 있는 파티클들이 살아남으므로 주의
+        penalty_for_dynamic = -2.0
+        log_scores_per_ray[is_dynamic] = np.maximum(log_scores_per_ray[is_dynamic], penalty_for_dynamic)
+
+        # ---------------------------------------------
+        # 파티클별 총 Log Score 합산
+        total_log_scores = np.sum(log_scores_per_ray, axis=1)
         # 수치 안정성을 위해 max_log_score 사용
         max_log = np.max(total_log_scores)
 
         # 실제 가중치로 변환 (unnormalized)
         weights_unnorm = np.exp(total_log_scores - max_log)
 
-        # Augmented MCL Logic
-        # w_avg: 현재 관측의 평균 확률. exp(total_log_scores)의 평균.
-        # 수치적 안정을 위해: mean(weights_unnorm) * exp(max_log)
-        current_w_avg = np.mean(weights_unnorm) * np.exp(max_log)
-
-        # 값이 너무 작아지면(완전히 길을 잃음) 0으로 수렴하겠지만,
-        # w_slow가 너무 작아지는 것을 방지하기 위해 최소값 클리핑 등을 고려할 수 있음.
-        if self.w_slow == 0.0:
-            self.w_slow = current_w_avg
-            self.w_fast = current_w_avg
-        else:
-            self.w_fast += self.alpha_fast * (current_w_avg - self.w_fast)
-            self.w_slow += self.alpha_slow * (current_w_avg - self.w_slow)
-
         # 모든 가중치가 0이 되는 경우 방어 (Kidnapped Robot 상황)
         sum_weights = np.sum(weights_unnorm)
+
         if sum_weights < 1e-15 or np.isnan(sum_weights):
+            print("kidnapped!")
             self._recover_from_kidnapping()
-            self.w_slow = 0.0
-            self.w_fast = 0.0
         else:
             self.weights = weights_unnorm / sum_weights
 
@@ -341,9 +364,9 @@ class ParticleFilter:
 
         # KLD 기반 파티클 수 계산
         # 현재 파티클 분포가 차지하는 '빈(Bin)'의 개수를 세야 함
-        # 해상도: 위치 0.1m, 각도 5도 정도로 설정
-        xy_res = 0.1
-        yaw_res = np.deg2rad(5)
+        # 해상도: 위치 0.2m, 각도 10도 정도로 설정
+        xy_res = 0.5
+        yaw_res = np.deg2rad(10)
 
         # 각 파티클의 Bin 인덱스 계산
         k_x = np.floor(self.particles[:, 0] / xy_res).astype(np.int64)
@@ -371,55 +394,25 @@ class ParticleFilter:
 
         # 파티클 수 클램핑
         new_n = max(self.min_particles, min(self.max_particles, new_n))
-
-        # Augmented MCL: 랜덤 파티클 주입 비율 계산
-        # w_fast(단기 평균)가 w_slow(장기 평균)보다 작을수록(갑자기 위치를 잃음) 랜덤 파티클 비율 증가
-        w_diff = 1.0 - (self.w_fast / self.w_slow + 1e-9) # zero division 방지
-        random_prob = max(0.0, w_diff)
-
-        # 총 파티클 수(new_n) 중에서 몇 개를 랜덤으로 할지 결정
-        num_random = int(new_n * random_prob)
-        num_resample = new_n - num_random
+        self.num_particles = new_n
 
         # 파티클 리샘플링
-        if num_resample > 0:
-            cumsum = np.cumsum(self.weights)
-            cumsum[-1] = 1.0 + 1e-6
-            step = 1.0 / num_resample
-            r = np.random.uniform(0, step)
-            points = np.arange(num_resample, dtype=np.float32) * step + r
-            indices = np.searchsorted(cumsum, points)
-            resampled_particles = self.particles[indices]
-        else:
-            resampled_particles = np.zeros((0, 3), dtype=np.float32)
+        cumsum = np.cumsum(self.weights)
+        cumsum[-1] = 1.0 + 1e-6
 
-        # 3. 랜덤 파티클 생성 (Augmented part)
-        if num_random > 0:
-            random_particles = self._generate_random_particles(num_random)
-        else:
-            random_particles = np.zeros((0, 3), dtype=np.float32)
+        step = 1.0 / new_n
+        r = np.random.uniform(0, step)
+        points = np.arange(new_n, dtype=np.float32) * step + r
 
-        # 파티클 병합 및 상태 갱신
-        # 만약 랜덤 파티클 생성이 실패했을 경우(맵 없음 등), 기존 리샘플링만으로 채움
-        if len(random_particles) == 0:
-            # 랜덤 파티클 생성 실패 시 부족한 만큼 추가 리샘플링 하거나 복사
-            total_particles = resampled_particles
-            self.num_particles = len(total_particles)
-        else:
-            total_particles = np.vstack((resampled_particles, random_particles))
-            self.num_particles = len(total_particles)
+        indices = np.searchsorted(cumsum, points)
 
-        # 버퍼에 저장
-        self.particles_buffer[:self.num_particles] = total_particles
-        self.particles = self.particles_buffer[:self.num_particles]
+        # 인덱스 범위 안전 장치
+        indices = np.clip(indices, 0, len(self.weights) - 1)
 
-        # Best Particle 보존 (랜덤 파티클 때문에 최적해가 사라지는 것 방지)
-        # 단, 랜덤 파티클 비율이 100%가 아닐 때만 유효
-        if num_resample > 0:
-            self.particles[0] = best_particle
-
-        # 가중치 초기화
-        self.weights = np.ones(self.num_particles, dtype=np.float32) / self.num_particles
+        self.particles_buffer[:new_n] = self.particles[indices]
+        self.particles = self.particles_buffer[:new_n]
+        self.particles[0] = best_particle  # Best 보존
+        self.weights = np.ones(new_n, dtype=np.float32) / new_n
 
     def get_estimated_pose(self):
         """
@@ -436,7 +429,7 @@ class ParticleFilter:
 
         # Best Particle 주변 일정 반경 내의 파티클만 골라내기
         # 이 반경은 로봇의 크기나 환경에 따라 조절 (보통 0.5m ~ 1.0m)
-        search_radius = 0.5
+        search_radius = 1.0
 
         dx = self.particles[:, 0] - best_particle[0]
         dy = self.particles[:, 1] - best_particle[1]
