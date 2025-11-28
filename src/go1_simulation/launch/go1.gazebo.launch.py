@@ -2,13 +2,13 @@
 
 import os
 from launch import LaunchDescription
-from launch.actions import (AppendEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable)
+from launch.actions import (AppendEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription,
+                            SetEnvironmentVariable, ExecuteProcess, TimerAction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
-from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
+from launch.substitutions import LaunchConfiguration, PathJoinSubstitution, PythonExpression
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-from launch.substitutions import PythonExpression
 
 
 def generate_launch_description():
@@ -27,7 +27,7 @@ def generate_launch_description():
     models_dir_name = 'models'
     fuel_models_dir_name = 'fuel_models'
     worlds_dir_name = 'worlds'
-    default_world_file_name = 'hospital.world'    
+    default_world_file_name = 'hospital.world'
 
     # Path to the ROS-Gazebo bridge configuration file
     ros_gz_bridge_config_file_name = 'config/ros_gz_bridge.yaml'
@@ -37,14 +37,13 @@ def generate_launch_description():
     go1_pkg_share_dir = FindPackageShare(package=go1_pkg_name).find(go1_pkg_name)
     default_ros_gz_bridge_config_file = os.path.join(go1_pkg_share_dir, ros_gz_bridge_config_file_name)
     # Gazebo simulation package
-    pkg_ros_gz_sim = FindPackageShare(package='ros_gz_sim').find('ros_gz_sim')    
+    pkg_ros_gz_sim = FindPackageShare(package='ros_gz_sim').find('ros_gz_sim')
     # Gazebo world and model packge
     world_pkg_share_dir = FindPackageShare(package=world_pkg_name).find(world_pkg_name)
     models_dir = os.path.join(world_pkg_share_dir, models_dir_name)
     fuel_models_dir = os.path.join(world_pkg_share_dir, fuel_models_dir_name)
 
     # Export GZ_SIM_RESOURCE_PATH
-    # Without GZ_SIM_RESOURCE_PATH, Gazebo will not find the models and fuel models.
     gz_resource_path = f"{models_dir}:{fuel_models_dir}:/opt/ros/jazzy/share"
 
     # Launch configuration variables
@@ -54,6 +53,7 @@ def generate_launch_description():
     use_gt_pose = LaunchConfiguration('use_gt_pose')
     use_gpu = LaunchConfiguration('use_gpu')
     headless = LaunchConfiguration('headless')
+    sim_speed = LaunchConfiguration('sim_speed')
 
     # Set the pose configuration variables
     x = LaunchConfiguration('x')
@@ -63,11 +63,10 @@ def generate_launch_description():
     pitch = LaunchConfiguration('pitch')
     yaw = LaunchConfiguration('yaw')
 
-    # Declare the launch arguments
     declare_robot_name_cmd = DeclareLaunchArgument(
         name='robot_name',
         default_value=default_robot_name,
-        description='The name for the robot')    
+        description='The name for the robot')
 
     declare_use_sim_time_cmd = DeclareLaunchArgument(
         name='use_sim_time',
@@ -88,81 +87,50 @@ def generate_launch_description():
         name='use_gpu',
         default_value='true',
         description='Flag to enable using GPU for rendering')
-        
-    # [추가됨] Headless 모드 실행 인자 선언
+
     declare_headless_cmd = DeclareLaunchArgument(
         name='headless',
         default_value='False',
         description='Run Gazebo in headless mode (no GUI) if true')
 
+    declare_sim_speed_cmd = DeclareLaunchArgument(
+        name='sim_speed',
+        default_value='0.5',
+        description='Simulation speed (Real Time Factor). 1.0 is real time, 0.5 is half speed.')
+
     # Pose arguments
     declare_x_cmd = DeclareLaunchArgument(
-        name='x',
-        default_value='0.0',
-        description='x component of initial position, meters')
-
+        name='x', default_value='0.0', description='x component of initial position')
     declare_y_cmd = DeclareLaunchArgument(
-        name='y',
-        default_value='1.0',
-        description='y component of initial position, meters')
-
+        name='y', default_value='1.0', description='y component of initial position')
     declare_z_cmd = DeclareLaunchArgument(
-        name='z',
-        default_value='0.5',
-        description='z component of initial position, meters')
-
+        name='z', default_value='0.2', description='z component of initial position')
     declare_roll_cmd = DeclareLaunchArgument(
-        name='roll',
-        default_value='0.0',
-        description='roll angle of initial orientation, radians')
-
+        name='roll', default_value='0.0', description='roll angle of initial orientation')
     declare_pitch_cmd = DeclareLaunchArgument(
-        name='pitch',
-        default_value='0.0',
-        description='pitch angle of initial orientation, radians')
-
+        name='pitch', default_value='0.0', description='pitch angle of initial orientation')
     declare_yaw_cmd = DeclareLaunchArgument(
-        name='yaw',
-        default_value='0.0',
-        description='yaw angle of initial orientation, radians')
+        name='yaw', default_value='0.0', description='yaw angle of initial orientation')
 
     # Set Gazebo to use GPU
-    # Force OpenGL to prefer the dedicated GPU
     set_gpu_render_cmd = SetEnvironmentVariable(
-        name='MESA_DEDICATE_DEVICE_ID',
-        value='0', 
-        condition=IfCondition(use_gpu)
-    )
-
+        name='MESA_DEDICATE_DEVICE_ID', value='0', condition=IfCondition(use_gpu))
     set_nv_offload_cmd = SetEnvironmentVariable(
-        name='__NV_PRIME_RENDER_OFFLOAD',
-        value='1',
-        condition=IfCondition(use_gpu)
-    )
-
+        name='__NV_PRIME_RENDER_OFFLOAD', value='1', condition=IfCondition(use_gpu))
     set_glx_vendor_cmd = SetEnvironmentVariable(
-        name='__GLX_VENDOR_LIBRARY_NAME',
-        value='nvidia',
-        condition=IfCondition(use_gpu)
-    )
+        name='__GLX_VENDOR_LIBRARY_NAME', value='nvidia', condition=IfCondition(use_gpu))
 
     # Set Gazebo resource path
     set_gz_resource_path = SetEnvironmentVariable(
-        name='GZ_SIM_RESOURCE_PATH',
-        value=gz_resource_path
-    )    
-    
-    # Launch Gazebo world
-    # headless가 'true' 혹은 'True'일 경우 '-s -r' 옵션을, 아니면 '-r' 옵션을 사용
-    # -s: server only (headless mode)
-    # -r: run simulation immediately
+        name='GZ_SIM_RESOURCE_PATH', value=gz_resource_path)
+
+    # Launch Gazebo world logic
     gz_args_string = PythonExpression([
         '"-s -r " if "', headless, '" == "true" or "', headless, '" == "True" else "-r "'
     ])
 
-    # Launch Gazebo world
-    # 'world_file' changes with launch argument 'world_file_name'
     world_file = PathJoinSubstitution([world_pkg_share_dir, worlds_dir_name, world_file_name])
+
     start_gazebo_world_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_ros_gz_sim, 'launch', 'gz_sim.launch.py')),
@@ -171,16 +139,33 @@ def generate_launch_description():
         }.items()
     )
 
-    # Bridge ROS topics and Gazebo messages for establishing communication
-    # This enables sensors (Gazebo -> ROS) and motors (ROS -> Gazebo). 
-    # Sensor configs are defined in 'config/ros_gz_bridge.yaml'
-    # Motor configs are defined in 'urdf/control/go1_ros2_control.urdf.xacro', and 'urdf/control/gazebo_sim_ros2_control.urdf.xacro'
+    # [수정 3] gazebo_world_name 변수가 정의되지 않았던 문제 해결
+    # 파일 이름에서 확장자(.world)를 제거하여 월드 이름으로 추정 (예: hospital.world -> hospital)
+    world_name_extracted = PythonExpression(["'", world_file_name, "'.replace('.world', '')"])
+
+    # 시뮬레이션 속도 조절 명령
+    set_physics_speed_cmd = ExecuteProcess(
+        cmd=[[
+            'gz service -s /world/', world_name_extracted, '/set_physics ',
+            '--reqtype gz.msgs.Physics ',
+            '--reptype gz.msgs.Boolean ',
+            '--timeout 3000 ',
+            '--req \'real_time_factor: ', sim_speed, '\''
+        ]],
+        shell=True,
+        output='screen'
+    )
+
+    delayed_set_speed_cmd = TimerAction(
+        period=5.0,
+        actions=[set_physics_speed_cmd]
+    )
+
+    # Bridge ROS topics and Gazebo messages
     start_gazebo_ros_bridge_cmd = Node(
         package='ros_gz_bridge',
         executable='parameter_bridge',
-        parameters=[{
-            'config_file': default_ros_gz_bridge_config_file,
-        }],
+        parameters=[{'config_file': default_ros_gz_bridge_config_file}],
         output='screen'
     )
 
@@ -189,26 +174,18 @@ def generate_launch_description():
         PythonLaunchDescriptionSource([
             os.path.join(go1_pkg_share_dir, 'launch', 'robot_state_publisher.launch.py')
         ]),
-        launch_arguments={
-            'use_sim_time': use_sim_time
-        }.items()
+        launch_arguments={'use_sim_time': use_sim_time}.items()
     )
 
-    # Load the ROS 2 controllers (joint controllers)
-    # Joint controller itself is independent of Gazebo. 
-    # It is only responsible for sending commands to the motor topic in ROS2.
+    # Load the ROS 2 controllers
     load_controllers_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource([
             os.path.join(go1_pkg_share_dir, 'launch', 'load_ros2_controllers.launch.py')
         ]),
-        launch_arguments={
-            'use_sim_time': use_sim_time
-        }.items()
+        launch_arguments={'use_sim_time': use_sim_time}.items()
     )
 
     # Spawn the robot in Gazebo
-    # Based on the '/robot_description' topic, Gazebo will spawn the robot in the world.
-    # It also connect ROS2 joint command from the joint controllers to the motor topic in Gazebo.
     start_gazebo_ros_spawner_cmd = Node(
         package='ros_gz_sim',
         executable='create',
@@ -217,23 +194,18 @@ def generate_launch_description():
             '-topic', '/robot_description',
             '-name', robot_name,
             '-allow_renaming', 'true',
-            '-x', x,
-            '-y', y,
-            '-z', z,
-            '-R', roll,
-            '-P', pitch,
-            '-Y', yaw
+            '-x', x, '-y', y, '-z', z,
+            '-R', roll, '-P', pitch, '-Y', yaw
         ])
 
-    # Publish the pointcloud from the depth camera (face and top)
+    # Publish pointcloud
     go1_pointcloud_publisher_cmd = Node(
         package='go1_simulation',
         executable='publish_pointcloud.py',
         output='screen',
-    )        
-        
-    # Publish the GT pose of the robot
-    # When use_gt_pose is true, set comparison to false (publishes to _gt topics)
+    )
+
+    # Publish GT pose
     go1_gt_pose_publisher_cmd = Node(
         package='go1_simulation',
         executable='go1_gt_pose_publisher.py',
@@ -245,15 +217,14 @@ def generate_launch_description():
     # Create the launch description and populate
     ld = LaunchDescription()
 
-    ld.add_action(declare_headless_cmd)
-    # Declare the launch options
+    # Declare arguments
     ld.add_action(declare_robot_name_cmd)
     ld.add_action(declare_use_sim_time_cmd)
     ld.add_action(declare_world_file_name_cmd)
     ld.add_action(declare_use_gt_pose_cmd)
     ld.add_action(declare_use_gpu_cmd)
-
-    # Add pose arguments
+    ld.add_action(declare_headless_cmd)
+    ld.add_action(declare_sim_speed_cmd)
     ld.add_action(declare_x_cmd)
     ld.add_action(declare_y_cmd)
     ld.add_action(declare_z_cmd)
@@ -261,12 +232,13 @@ def generate_launch_description():
     ld.add_action(declare_pitch_cmd)
     ld.add_action(declare_yaw_cmd)
 
-    # Add the actions to the launch description
+    # Add actions
     ld.add_action(set_gpu_render_cmd)
     ld.add_action(set_nv_offload_cmd)
     ld.add_action(set_glx_vendor_cmd)
     ld.add_action(set_gz_resource_path)
     ld.add_action(start_gazebo_world_cmd)
+    ld.add_action(delayed_set_speed_cmd)  # 속도 조절 명령
     ld.add_action(start_gazebo_ros_bridge_cmd)
     ld.add_action(robot_state_publisher_cmd)
     ld.add_action(load_controllers_cmd)
