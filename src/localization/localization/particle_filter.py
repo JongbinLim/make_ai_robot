@@ -1,196 +1,267 @@
 import numpy as np
 from scipy.ndimage import distance_transform_edt
-from numba import njit, prange
+import sys
+from numba import njit
 
 
 # ==============================================================================
-# Numba JIT Optimized Kernels (클래스 외부 정의)
+# Numba Optimized Kernels (JIT 컴파일 함수들)
 # ==============================================================================
 
-@njit(cache=True)
-def _fast_predict(particles, dx, dy, dyaw, motion_noise):
+@njit(fastmath=True, cache=True)
+def predict_kernel(particles, dx, dy, dyaw, alphas, min_noise):
     """
-    Motion Model 연산 가속
+    Motion Model 커널
+    Numpy 벡터 연산 대신 명시적 루프를 사용할 수도 있지만,
+    여기서는 기본 벡터 연산이 Numba에서도 매우 효율적으로 최적화됩니다.
     """
     n = len(particles)
-    # 노이즈 생성
-    noise_x = np.random.normal(0, motion_noise[0], n)
-    noise_y = np.random.normal(0, motion_noise[1], n)
-    noise_yaw = np.random.normal(0, motion_noise[2], n)
 
-    # In-place 업데이트를 위한 루프
+    # 이동 거리 및 회전량 계산
+    dist_trans = np.sqrt(dx ** 2 + dy ** 2)
+    dist_rot = np.abs(dyaw)
+
+    # 노이즈 표준편차 계산
+    sigma_x = max(alphas[0] * dist_trans + alphas[1] * dist_rot, min_noise[0])
+    sigma_y = max(alphas[2] * dist_trans + alphas[3] * dist_rot, min_noise[1])
+    sigma_yaw = max(alphas[4] * dist_trans + alphas[5] * dist_rot, min_noise[2])
+
+    # 파티클 업데이트 루프
+    # Numba는 루프 내부의 sin/cos 연산을 매우 효율적으로 병렬화/최적화합니다.
     for i in range(n):
+        # 노이즈 생성
+        noise_x = np.random.normal(0, sigma_x)
+        noise_y = np.random.normal(0, sigma_y)
+        noise_yaw = np.random.normal(0, sigma_yaw)
+
+        noisy_dx = dx + noise_x
+        noisy_dy = dy + noise_y
+        noisy_dyaw = dyaw + noise_yaw
+
+        p_x = particles[i, 0]
+        p_y = particles[i, 1]
         p_yaw = particles[i, 2]
+
         c = np.cos(p_yaw)
         s = np.sin(p_yaw)
 
-        # 노이즈가 섞인 이동량
-        d_x_noisy = dx + noise_x[i]
-        d_y_noisy = dy + noise_y[i]
-        d_yaw_noisy = dyaw + noise_yaw[i]
-
-        # 좌표 변환 및 적용
-        particles[i, 0] += (d_x_noisy * c - d_y_noisy * s)
-        particles[i, 1] += (d_x_noisy * s + d_y_noisy * c)
-        particles[i, 2] += d_yaw_noisy
-
-        # Yaw 정규화 (-pi ~ pi)
-        # (angle + pi) % 2pi - pi 방식의 수식
-        particles[i, 2] = (particles[i, 2] + np.pi) % (2 * np.pi) - np.pi
+        # 위치 업데이트
+        particles[i, 0] = p_x + (noisy_dx * c - noisy_dy * s)
+        particles[i, 1] = p_y + (noisy_dx * s + noisy_dy * c)
+        particles[i, 2] = p_yaw + noisy_dyaw
 
 
-@njit(parallel=True, cache=True)
-def _fast_update_likelihood(particles,
-                            ranges,
-                            ranges_cos,
-                            ranges_sin,
-                            sensor_offset,
-                            map_flat,
-                            map_width,
-                            map_height,
-                            map_resolution,
-                            map_origin,
-                            penalty_idx):
+@njit(fastmath=True, cache=True)
+def update_likelihood_kernel(particles, ranges, ranges_cos, ranges_sin,
+                             map_flat, dist_map_flat,
+                             map_width, map_height, map_res, map_origin_x, map_origin_y,
+                             sensor_offset_x, sensor_offset_y,
+                             penalty_idx, dist_threshold, min_log_prob):
     """
-    Likelihood Field Update 가속 (병렬 처리 핵심 구간)
-    메모리 할당을 줄이고 CPU 코어를 모두 사용하여 계산합니다.
+    Sensor Model 커널 (가장 부하가 큰 부분)
+    모든 파티클 * 모든 레이에 대해 좌표 변환 및 맵 조회를 수행합니다.
     """
-    n_particles = particles.shape[0]
-    n_rays = ranges.shape[0]
+    n_particles = len(particles)
+    n_rays = len(ranges)
+    inv_res = 1.0 / map_res
 
-    # 결과 점수 배열
-    scores = np.zeros(n_particles, dtype=np.float32)
+    weights_unnorm = np.zeros(n_particles, dtype=np.float32)
 
-    inv_res = 1.0 / map_resolution
-    ox = map_origin[0]
-    oy = map_origin[1]
+    # 동적 장애물 처리를 위한 페널티 상수
+    penalty_for_dynamic = -1.5
 
-    sensor_x = sensor_offset[0]
-    sensor_y = sensor_offset[1]
-
-    # Laser Points in Robot Frame (미리 계산된 cos/sin 사용)
-    # ranges는 이미 valid mask가 적용된 상태여야 함
-    laser_x = ranges * ranges_cos + sensor_x
-    laser_y = ranges * ranges_sin + sensor_y
-
-    # 병렬 루프 (각 파티클은 독립적임)
-    for i in prange(n_particles):
+    for i in range(n_particles):
         px = particles[i, 0]
         py = particles[i, 1]
-        p_yaw = particles[i, 2]
+        pyaw = particles[i, 2]
 
-        c = np.cos(p_yaw)
-        s = np.sin(p_yaw)
+        c = np.cos(pyaw)
+        s = np.sin(pyaw)
 
-        sum_log_prob = 0.0
+        total_log_score = 0.0
 
         for j in range(n_rays):
-            # 1. 로봇 프레임 -> 월드 프레임 변환
-            # wx = px + (c * lx - s * ly)
-            lx = laser_x[j]
-            ly = laser_y[j]
+            # 1. 로봇 프레임 내 레이 좌표
+            # 미리 계산된 ranges_cos/sin 사용
+            r_cos = ranges_cos[j]
+            r_sin = ranges_sin[j]
 
+            # 센서 오프셋 적용
+            lx = r_cos + sensor_offset_x
+            ly = r_sin + sensor_offset_y
+
+            # 2. 월드 좌표 변환
             wx = px + (c * lx - s * ly)
             wy = py + (s * lx + c * ly)
 
-            # 2. 맵 인덱싱
-            map_x = int((wx - ox) * inv_res)
-            map_y = int((wy - oy) * inv_res)
+            # 3. 맵 인덱스 계산
+            mx = int((wx - map_origin_x) * inv_res)
+            my = int((wy - map_origin_y) * inv_res)
 
-            idx = penalty_idx  # 기본값: 맵 밖 패널티
+            idx = penalty_idx  # 기본값: 맵 밖
 
-            if 0 <= map_x < map_width and 0 <= map_y < map_height:
-                idx = map_y * map_width + map_x
+            # 맵 범위 체크
+            if 0 <= mx < map_width and 0 <= my < map_height:
+                idx = my * map_width + mx
 
-            # 3. Log Likelihood 누적
-            sum_log_prob += map_flat[idx]
+            # 4. 점수 조회
+            score = map_flat[idx]
+            dist_val = dist_map_flat[idx]
 
-        scores[i] = sum_log_prob
+            # 5. 동적 장애물 처리 (Robust Likelihood)
+            # 센서값은 유효한데 맵 상의 거리가 멀다면(동적 장애물), 페널티 완화
+            if dist_val > dist_threshold:
+                if score < penalty_for_dynamic:
+                    score = penalty_for_dynamic
 
-    return scores
+            total_log_score += score
+
+        # Log-Sum-Exp 트릭을 위해 여기서는 log score만 저장
+        weights_unnorm[i] = total_log_score
+
+    # Log-Sum-Exp trick to avoid overflow/underflow
+    max_log = -1e9  # 매우 작은 수
+    for i in range(n_particles):
+        if weights_unnorm[i] > max_log:
+            max_log = weights_unnorm[i]
+
+    sum_w = 0.0
+    for i in range(n_particles):
+        # exp(score - max)
+        val = np.exp(weights_unnorm[i] - max_log)
+        weights_unnorm[i] = val
+        sum_w += val
+
+    return weights_unnorm, sum_w
 
 
-@njit(cache=True)
-def _fast_resample_kld(particles, weights,
-                       min_particles, max_particles,
-                       kld_err, kld_z,
-                       xy_res, yaw_res):
+@njit(fastmath=True, cache=True)
+def compute_kld_number_kernel(particles, weights, xy_res, yaw_res, kld_z, kld_err, min_particles, max_particles):
     """
-    KLD Sampling 및 Low Variance Resampling 로직 통합 가속
+    KLD(Kullback-Leibler Divergence) 샘플링 수 계산 커널
     """
-    # 1. KLD: 현재 분포의 Bin 개수 세기
-    n_curr = len(particles)
+    n = len(particles)
 
-    # Binning을 위한 큰 정수 multiplier
-    m_y = 100000
-    m_yaw = 10000000000
+    # Bin 계산을 위한 간단한 해싱
+    # 3D 좌표 -> 1D 해시
+    # 정수 오버플로우 방지를 위해 x, y 범위가 너무 크지 않다고 가정하거나 배율 조정
 
-    # 3D 좌표 -> 1D 해시 (Binning)
-    bins = np.empty(n_curr, dtype=np.int64)
-    for i in range(n_curr):
-        kx = np.floor(particles[i, 0] / xy_res)
-        ky = np.floor(particles[i, 1] / xy_res)
-        kyaw = np.floor(particles[i, 2] / yaw_res)
-        bins[i] = int(kx) + int(ky) * m_y + int(kyaw) * m_yaw
+    # 단순화를 위해 정렬을 이용한 유니크 카운팅
+    bins = np.empty(n, dtype=np.int64)
 
-    # Unique Bin 개수 (k)
-    unique_bins = np.unique(bins)
-    k = len(unique_bins)
+    for i in range(n):
+        kx = np.int64(np.floor(particles[i, 0] / xy_res))
+        ky = np.int64(np.floor(particles[i, 1] / xy_res))
+        kyaw = np.int64(np.floor(particles[i, 2] / yaw_res))
 
-    # KLD 파티클 수 계산 공식
+        # 해시 충돌 가능성이 매우 낮은 승수 사용
+        bins[i] = kx + ky * 100000 + kyaw * 10000000000
+
+    # 정렬 후 유니크 개수 세기 (np.unique보다 빠를 수 있음)
+    bins.sort()
+
+    k = 0
+    if n > 0:
+        k = 1
+        for i in range(1, n):
+            if bins[i] != bins[i - 1]:
+                k += 1
+
     if k > 1:
-        # term1 = 1 - 2/(9(k-1))
-        # term2 = sqrt(2/(9(k-1))) * z
-        # n = (k-1) / (2*err) * (term1 + term2)^3
-
-        denom = 9.0 * (k - 1)
-        term1 = 1.0 - 2.0 / denom
-        term2 = np.sqrt(2.0 / denom) * kld_z
+        term1 = 1.0 - 2.0 / (9.0 * (k - 1))
+        term2 = np.sqrt(2.0 / (9.0 * (k - 1))) * kld_z
         term3 = term1 + term2
-
-        calculated_n = (k - 1) / (2.0 * kld_err) * (term3 * term3 * term3)
-        new_n = int(calculated_n)
+        new_n = int((k - 1) / (2.0 * kld_err) * (term3 ** 3))
     else:
         new_n = min_particles
 
-    # 클램핑
+    # 클램핑 (Python max/min은 Numba에서 지원)
     if new_n < min_particles: new_n = min_particles
     if new_n > max_particles: new_n = max_particles
 
     return new_n
 
 
-@njit(cache=True)
-def _low_variance_sampler(particles, weights, n_resample):
+@njit(fastmath=True, cache=True)
+def low_variance_resample_kernel(particles, weights, new_n, best_particle):
     """
-    Low Variance Resampling 알고리즘 (O(N))
+    Low Variance Resampling (Wheel Algorithm)
+    O(N) 복잡도로 매우 빠름
     """
-    resampled = np.zeros((n_resample, 3), dtype=np.float32)
+    n_current = len(weights)
+    new_particles = np.zeros((new_n, 3), dtype=np.float32)
 
-    # Cumulative Weights
-    cumsum = np.cumsum(weights)
-    cumsum[-1] = 1.0 + 1e-6  # 부동소수점 오차 보정
+    # Best particle 보존
+    new_particles[0] = best_particle
 
-    step = 1.0 / n_resample
+    step = 1.0 / new_n
     r = np.random.uniform(0, step)
 
-    # 투 포인터 방식 or searchsorted
-    # Numba에서는 searchsorted가 매우 빠름
-    points = np.arange(n_resample, dtype=np.float32) * step + r
-    indices = np.searchsorted(cumsum, points)
+    c = weights[0]
+    i = 0
 
-    for i in range(n_resample):
-        idx = indices[i]
-        # 인덱스 범위 안전장치
-        if idx >= len(particles):
-            idx = len(particles) - 1
-        resampled[i] = particles[idx]
+    # 1번째 파티클은 이미 채웠으므로 1부터 시작
+    for j in range(1, new_n):
+        u = r + j * step
+        while u > c and i < n_current - 1:
+            i += 1
+            c += weights[i]
 
-    return resampled
+        new_particles[j, 0] = particles[i, 0]
+        new_particles[j, 1] = particles[i, 1]
+        new_particles[j, 2] = particles[i, 2]
+
+    return new_particles
+
+
+@njit(fastmath=True, cache=True)
+def compute_pose_mean_kernel(particles, weights, top_k_ratio):
+    """
+    상위 K% 파티클 기반 가중 평균 계산
+    """
+    n = len(particles)
+    n_top = int(max(5, n * top_k_ratio))
+
+    # Numba에서는 argsort가 지원됨
+    # 가중치 내림차순 정렬 인덱스
+    # (참고: 전체 정렬은 O(NlogN)이지만 N=3000 정도에서는 충분히 빠름)
+    idxs = np.argsort(weights)[::-1]
+
+    top_idxs = idxs[:n_top]
+
+    x_sum = 0.0
+    y_sum = 0.0
+    sin_sum = 0.0
+    cos_sum = 0.0
+    w_sum = 0.0
+
+    for i in range(n_top):
+        idx = top_idxs[i]
+        w = weights[idx]
+
+        x_sum += particles[idx, 0] * w
+        y_sum += particles[idx, 1] * w
+        sin_sum += np.sin(particles[idx, 2]) * w
+        cos_sum += np.cos(particles[idx, 2]) * w
+        w_sum += w
+
+    if w_sum == 0:
+        return np.mean(particles[:, 0]), np.mean(particles[:, 1]), np.mean(particles[:, 2])
+
+    return x_sum / w_sum, y_sum / w_sum, np.arctan2(sin_sum, cos_sum)
+
+
+@njit(fastmath=True, cache=True)
+def normalize_angle_kernel(particles):
+    """각도 정규화 (-pi ~ pi)"""
+    n = len(particles)
+    for i in range(n):
+        angle = particles[i, 2]
+        particles[i, 2] = (angle + np.pi) % (2 * np.pi) - np.pi
 
 
 # ==============================================================================
-# Particle Filter Class
+# Main Class
 # ==============================================================================
 
 class ParticleFilter:
@@ -203,72 +274,69 @@ class ParticleFilter:
         self.max_particles = max_particles
         self.num_particles = max_particles
 
-        # 버퍼: 메모리 재할당 방지
-        self.particles_buffer = np.zeros((self.max_particles, 3), dtype=np.float32)
-        self.particles = self.particles_buffer[:self.num_particles]
+        # Numba 호환성을 위해 Contiguous Array 유지
+        self.particles = np.zeros((self.max_particles, 3), dtype=np.float32)
         self.weights = np.ones(self.num_particles, dtype=np.float32) / self.num_particles
 
         self.initial_noise = np.array(initial_noise, dtype=np.float32)
-        self.motion_noise = np.array([0.02, 0.02, 0.01], dtype=np.float32)
 
-        self.sensor_sigma = 0.1
+        # Motion Parameters
+        #self.motion_alphas = np.array([0.1, 0.1, 0.05, 0.1, 0.07, 0.1], dtype=np.float32)
+        self.motion_alphas = np.array([0.9, 0.9, 0.04, 0.09, 0.06, 0.09], dtype=np.float32)
+        self.min_motion_noise = np.array([0.01, 0.01, 0.015], dtype=np.float32)
+
+        self.last_estimated_pose = None
+
+        # Sensor Model Parameters
+        self.sensor_sigma = 0.18
         self.sensor_model_factor = -0.5 / (self.sensor_sigma ** 2)
+        self.dist_threshold = self.sensor_sigma * 3
 
-        # KLD params
-        self.kld_err = 0.05  # 오차 범위 (조금 더 타이트하게 잡음)
-        self.kld_z = 2.32  # 99% 신뢰구간 (z값 변경 가능)
+        # KLD Parameters
+        self.kld_err = 0.015
+        self.kld_z = 2.326
 
-        # AMCL params
-        self.w_slow = 0.0
-        self.w_fast = 0.0
-        self.alpha_slow = 0.001
-        self.alpha_fast = 0.1
-
-        # Map params
-        self.log_likelihood_map_flat = np.zeros(1, dtype=np.float32)
-        self.map_resolution = 0.05
+        # Map Data
+        self.log_likelihood_map_flat = None
+        self.dist_map_flat = None
+        self.map_info = None
+        self.map_resolution = 0.025
         self.map_origin = np.array([0, 0], dtype=np.float32)
         self.map_width = 0
         self.map_height = 0
         self.penalty_idx = 0
+
         self.free_space_indices = None
 
-        # Caching
+        # Trig Cache
         self.cached_n_scans = -1
-        self.cached_angle_min = 0.0
-        self.cached_angle_inc = 0.0
-        self.cached_step = 0
-        self.full_cos_cache = None
         self.full_sin_cache = None
-
-        self.scan_step = 5
+        self.full_cos_cache = None
+        self.scan_step = 4
 
     def initialize(self, x, y, yaw):
         self.num_particles = self.max_particles
-        self.particles = self.particles_buffer[:self.num_particles]
+        # 버퍼 전체가 아니라 현재 필요한 만큼만 슬라이싱하여 사용
+        # (주의: Numba 함수에 넘길 때는 항상 실제 데이터 크기에 맞춰야 함)
 
-        self.particles[:, 0] = np.random.normal(x, self.initial_noise[0], self.num_particles)
-        self.particles[:, 1] = np.random.normal(y, self.initial_noise[1], self.num_particles)
-        self.particles[:, 2] = np.random.normal(yaw, self.initial_noise[2], self.num_particles)
+        # 초기화는 자주 일어나지 않으므로 일반 Numpy 사용
+        self.particles[:self.num_particles, 0] = np.random.normal(x, self.initial_noise[0], self.num_particles)
+        self.particles[:self.num_particles, 1] = np.random.normal(y, self.initial_noise[1], self.num_particles)
+        self.particles[:self.num_particles, 2] = np.random.normal(yaw, self.initial_noise[2], self.num_particles)
 
-        # JIT 함수가 아니므로 Numpy 연산 사용
-        self.particles[:, 2] = (self.particles[:, 2] + np.pi) % (2 * np.pi) - np.pi
+        normalize_angle_kernel(self.particles[:self.num_particles])
         self.weights = np.ones(self.num_particles, dtype=np.float32) / self.num_particles
-
-        self.w_slow = 0.0
-        self.w_fast = 0.0
 
     def set_map(self, msg):
         """
-        Scipy를 사용하는 부분은 JIT 컴파일이 불가능하므로 순수 Python/Numpy로 유지합니다.
-        (초기화 시 1회만 실행되므로 성능 영향 적음)
+        맵 처리는 초기 1회만 수행되므로 Numba 최적화에서 제외하거나(Scipy 의존성),
+        필요하다면 별도로 처리. 여기서는 기존 로직 유지.
         """
         width = msg.info.width
         height = msg.info.height
         resolution = msg.info.resolution
 
-        if width <= 0 or height <= 0 or resolution <= 0:
-            return
+        if width <= 0 or height <= 0: return
 
         origin_x = msg.info.origin.position.x
         origin_y = msg.info.origin.position.y
@@ -282,205 +350,173 @@ class ParticleFilter:
 
         binary_free = (raw_data >= 0) & (raw_data < 50)
 
-        # Random Particle 생성을 위한 캐시
+        # 빈 공간 인덱싱
         y_idxs, x_idxs = np.where(binary_free)
         self.free_space_indices = np.column_stack((x_idxs, y_idxs)).astype(np.float32)
 
-        # EDT 및 Log Likelihood 계산
+        # EDT 계산
         dist_map_pixels = distance_transform_edt(binary_free)
         dist_map_meters = dist_map_pixels * resolution
-        log_likelihood_map = (dist_map_meters ** 2) * self.sensor_model_factor
 
-        min_log_prob = -20.0
+        log_likelihood_map = (dist_map_meters ** 2) * self.sensor_model_factor
+        min_log_prob = -10.0
         log_likelihood_map = np.maximum(log_likelihood_map, min_log_prob)
 
-        # Flatten 및 패딩 추가
+        # Flat Map 생성
         self.log_likelihood_map_flat = np.append(log_likelihood_map.ravel(), min_log_prob).astype(np.float32)
+        self.dist_map_flat = np.append(dist_map_meters.ravel(), 0.0).astype(np.float32)
         self.penalty_idx = self.map_size
 
     def predict(self, dx, dy, dyaw):
-        # Numba JIT 함수 호출
-        _fast_predict(self.particles, float(dx), float(dy), float(dyaw), self.motion_noise)
+        """Numba Kernel 호출"""
+        # 현재 활성화된 파티클 슬라이스 전달
+        active_particles = self.particles[:self.num_particles]
+
+        predict_kernel(
+            active_particles,
+            float(dx), float(dy), float(dyaw),
+            self.motion_alphas, self.min_motion_noise
+        )
+
+        # 각도 정규화
+        normalize_angle_kernel(active_particles)
 
     def _update_trig_cache(self, n_scans, angle_min, angle_inc, step):
         self.cached_n_scans = n_scans
-        self.cached_angle_min = angle_min
-        self.cached_angle_inc = angle_inc
-        self.cached_step = step
-
         angles = np.arange(n_scans, dtype=np.float32)[::step] * angle_inc + angle_min
         self.full_cos_cache = np.cos(angles).astype(np.float32)
         self.full_sin_cache = np.sin(angles).astype(np.float32)
 
-    def _generate_random_particles(self, n_particles):
-        if self.free_space_indices is None or n_particles <= 0:
-            return np.zeros((0, 3), dtype=np.float32)
-
-        idx_indices = np.random.choice(len(self.free_space_indices), size=n_particles)
-        chosen = self.free_space_indices[idx_indices]
-
-        x = chosen[:, 0] * self.map_resolution + self.map_origin[0]
-        y = chosen[:, 1] * self.map_resolution + self.map_origin[1]
-
-        # 그리드 내 랜덤 위치
-        x += np.random.uniform(0, self.map_resolution, n_particles)
-        y += np.random.uniform(0, self.map_resolution, n_particles)
-        yaw = np.random.uniform(-np.pi, np.pi, n_particles)
-
-        return np.column_stack((x, y, yaw)).astype(np.float32)
-
     def _recover_from_kidnapping(self):
-        # 맵 정보가 있을 때만 복구 시도
-        if self.free_space_indices is not None:
-            self.particles[:] = self._generate_random_particles(self.num_particles)
-            self.weights = np.ones(self.num_particles, dtype=np.float32) / self.num_particles
-            self.w_slow = 0.0
-            self.w_fast = 0.0
+        """납치 복구 로직 (기존 Python 로직 유지)"""
+        if self.free_space_indices is None: return
+
+        print("[PF] Kidnap detected. Injecting random particles.")
+
+        keep_ratio = 0.3
+        n_keep = int(self.num_particles * keep_ratio)
+        n_random = self.num_particles - n_keep
+
+        # 상위 파티클 유지는 argsort로
+        sorted_indices = np.argsort(self.weights)[::-1]
+
+        # Numba 호환성을 위해 버퍼 직접 조작 대신 복사 방식 사용
+        # 현재 활성 파티클
+        current_p = self.particles[:self.num_particles]
+
+        # 상위 n_keep개
+        kept_particles = current_p[sorted_indices[:n_keep]].copy()
+
+        # 랜덤 파티클 생성
+        num_free = self.free_space_indices.shape[0]
+        rand_indices = np.random.choice(num_free, size=n_random)
+        chosen = self.free_space_indices[rand_indices]
+
+        rand_particles = np.zeros((n_random, 3), dtype=np.float32)
+        rand_particles[:, 0] = chosen[:, 0] * self.map_resolution + self.map_origin[0]
+        rand_particles[:, 1] = chosen[:, 1] * self.map_resolution + self.map_origin[1]
+        rand_particles[:, 0] += np.random.uniform(0, self.map_resolution, n_random)
+        rand_particles[:, 1] += np.random.uniform(0, self.map_resolution, n_random)
+        rand_particles[:, 2] = np.random.uniform(-np.pi, np.pi, n_random)
+
+        # 병합
+        self.particles[:n_keep] = kept_particles
+        self.particles[n_keep:self.num_particles] = rand_particles
+
+        self.weights = np.ones(self.num_particles, dtype=np.float32) / self.num_particles
 
     def update(self, scan_ranges, scan_angle_min, scan_angle_inc, sensor_offset=[0.0, 0.0]):
-        if self.log_likelihood_map_flat is None or scan_ranges is None:
-            return
+        if self.log_likelihood_map_flat is None: return
+        if scan_ranges is None or len(scan_ranges) == 0: return
 
         n_scans = len(scan_ranges)
-        if n_scans == 0: return
-
         if n_scans != self.cached_n_scans:
             self._update_trig_cache(n_scans, scan_angle_min, scan_angle_inc, self.scan_step)
 
-        # 데이터 전처리 (Numpy)
+        # 데이터 전처리
         step = self.scan_step
         raw_ranges = np.array(scan_ranges[::step], dtype=np.float32)
 
-        # Valid masking
-        mask = (raw_ranges > 0.1) & (raw_ranges < 10.0)
-        ranges = raw_ranges[mask]
+        # Valid Masking
+        valid_mask = (raw_ranges > 0.01) & (raw_ranges < 20.0)
+        ranges = raw_ranges[valid_mask]
 
-        if ranges.shape[0] == 0:
-            return
+        if len(ranges) == 0: return
 
-        ranges_cos = self.full_cos_cache[mask]
-        ranges_sin = self.full_sin_cache[mask]
+        # 마스킹된 cos/sin 배열 준비
+        ranges_cos = (ranges * self.full_cos_cache[valid_mask]).astype(np.float32)
+        ranges_sin = (ranges * self.full_sin_cache[valid_mask]).astype(np.float32)
 
-        sensor_offset_np = np.array(sensor_offset, dtype=np.float32)
-
-        # =========================================================
-        # [핵심] Numba Accelerated Update
-        # 모든 파티클에 대해 Likelihood를 병렬로 계산합니다.
-        # =========================================================
-        total_log_scores = _fast_update_likelihood(
-            self.particles,
-            ranges,
-            ranges_cos,
-            ranges_sin,
-            sensor_offset_np,
-            self.log_likelihood_map_flat,
-            self.map_width,
-            self.map_height,
-            self.map_resolution,
-            self.map_origin,
-            self.penalty_idx
+        # === Numba Kernel 호출 ===
+        # 무거운 연산(좌표변환 + 맵조회 + 확률계산)을 모두 넘김
+        weights_unnorm, sum_weights = update_likelihood_kernel(
+            self.particles[:self.num_particles],
+            ranges, ranges_cos, ranges_sin,
+            self.log_likelihood_map_flat, self.dist_map_flat,
+            self.map_width, self.map_height, self.map_resolution,
+            self.map_origin[0], self.map_origin[1],
+            float(sensor_offset[0]), float(sensor_offset[1]),
+            self.penalty_idx, self.dist_threshold, -10.0
         )
 
-        # 후처리 (Python/Numpy)
-        max_log = np.max(total_log_scores)
-        weights_unnorm = np.exp(total_log_scores - max_log)
-
-        current_w_avg = np.mean(weights_unnorm) * np.exp(max_log)
-
-        if self.w_slow == 0.0:
-            self.w_slow = current_w_avg
-            self.w_fast = current_w_avg
-        else:
-            self.w_fast += self.alpha_fast * (current_w_avg - self.w_fast)
-            self.w_slow += self.alpha_slow * (current_w_avg - self.w_slow)
-
-        sum_weights = np.sum(weights_unnorm)
+        # Kidnapped 체크
         if sum_weights < 1e-15 or np.isnan(sum_weights):
             self._recover_from_kidnapping()
         else:
             self.weights = weights_unnorm / sum_weights
 
+        # Resampling Check
         n_eff = 1.0 / np.sum(self.weights ** 2)
+
+        resampled = False
         if n_eff < self.num_particles / 2.0:
             self.resample()
+            resampled = True
+
+        # Debug Print (Optional)
+        # sys.stdout.write(f"\rN: {self.num_particles} Neff: {n_eff:.1f} MaxW: {np.max(self.weights):.4f}")
+        # sys.stdout.flush()
 
     def resample(self):
-        # Best Particle 백업
+        """KLD + Low Variance Resampling using Numba"""
+        # 1. KLD로 목표 파티클 수 계산
+        new_n = compute_kld_number_kernel(
+            self.particles[:self.num_particles],
+            self.weights,
+            0.1, np.deg2rad(2),  # resolution params
+            self.kld_z, self.kld_err,
+            self.min_particles, self.max_particles
+        )
+
+        # Best particle 찾기 (Python side)
         best_idx = np.argmax(self.weights)
         best_particle = self.particles[best_idx].copy()
 
-        # 1. KLD를 이용해 필요한 파티클 수 계산 (Numba)
-        xy_res = 0.1
-        yaw_res = np.deg2rad(5.0)
-
-        new_n = _fast_resample_kld(
-            self.particles, self.weights,
-            self.min_particles, self.max_particles,
-            self.kld_err, self.kld_z,
-            xy_res, yaw_res
+        # 2. Low Variance Resampling 실행
+        new_particles = low_variance_resample_kernel(
+            self.particles[:self.num_particles],
+            self.weights,
+            new_n,
+            best_particle
         )
 
-        # 2. Augmented MCL 랜덤 비율 계산
-        w_diff = 1.0 - (self.w_fast / self.w_slow)
-        random_prob = max(0.0, w_diff)
-
-        num_random = int(new_n * random_prob)
-        num_resample = new_n - num_random
-
-        # 3. Low Variance Resampling (Numba)
-        if num_resample > 0:
-            resampled_particles = _low_variance_sampler(self.particles, self.weights, num_resample)
-        else:
-            resampled_particles = np.zeros((0, 3), dtype=np.float32)
-
-        # 4. 랜덤 파티클 생성
-        if num_random > 0:
-            random_particles = self._generate_random_particles(num_random)
-        else:
-            random_particles = np.zeros((0, 3), dtype=np.float32)
-
-        # 병합
-        if len(random_particles) == 0:
-            total_particles = resampled_particles
-        else:
-            total_particles = np.vstack((resampled_particles, random_particles))
-
-        self.num_particles = len(total_particles)
-        self.particles_buffer[:self.num_particles] = total_particles
-        self.particles = self.particles_buffer[:self.num_particles]
-
-        # Best Particle 복원 (랜덤 노이즈 방지용)
-        if num_resample > 0:
-            self.particles[0] = best_particle
-
-        self.weights = np.ones(self.num_particles, dtype=np.float32) / self.num_particles
+        # 상태 업데이트
+        self.num_particles = new_n
+        # 버퍼에 복사
+        self.particles[:new_n] = new_particles
+        self.weights = np.ones(new_n, dtype=np.float32) / new_n
 
     def get_estimated_pose(self):
-        # 계산량이 적으므로 Numpy 유지
+        """Numba 커널을 이용해 가중 평균 계산"""
         if self.num_particles == 0:
-            return np.zeros(3)
+            return np.array([0, 0, 0], dtype=np.float32)
 
-        best_idx = np.argmax(self.weights)
-        best_particle = self.particles[best_idx]
+        x, y, yaw = compute_pose_mean_kernel(
+            self.particles[:self.num_particles],
+            self.weights,
+            0.2  # top 20%
+        )
 
-        # Best particle 주변 0.5m 이내만 평균
-        dx = self.particles[:, 0] - best_particle[0]
-        dy = self.particles[:, 1] - best_particle[1]
-        dist_sq = dx * dx + dy * dy
-
-        mask = dist_sq < (0.5 ** 2)
-        if np.sum(mask) <= 1:
-            return best_particle
-
-        cluster_p = self.particles[mask]
-        cluster_w = self.weights[mask]
-        cluster_w /= np.sum(cluster_w)
-
-        x = np.sum(cluster_p[:, 0] * cluster_w)
-        y = np.sum(cluster_p[:, 1] * cluster_w)
-
-        sin_sum = np.sum(np.sin(cluster_p[:, 2]) * cluster_w)
-        cos_sum = np.sum(np.cos(cluster_p[:, 2]) * cluster_w)
-        yaw = np.arctan2(sin_sum, cos_sum)
-
-        return np.array([x, y, yaw], dtype=np.float32)
+        current_pose = np.array([x, y, yaw], dtype=np.float32)
+        self.last_estimated_pose = current_pose
+        return current_pose
