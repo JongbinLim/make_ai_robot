@@ -1,7 +1,7 @@
 import numpy as np
 from scipy.ndimage import distance_transform_edt
 import sys
-from numba import njit
+from numba import njit, prange
 
 
 # ==============================================================================
@@ -70,7 +70,7 @@ def update_likelihood_kernel(particles, ranges, ranges_cos, ranges_sin,
     # 동적 장애물 처리를 위한 페널티 상수
     penalty_for_dynamic = -1.5
 
-    for i in range(n_particles):
+    for i in prange(n_particles):
         px = particles[i, 0]
         py = particles[i, 1]
         pyaw = particles[i, 2]
@@ -120,7 +120,7 @@ def update_likelihood_kernel(particles, ranges, ranges_cos, ranges_sin,
         weights_unnorm[i] = total_log_score
 
     # Log-Sum-Exp trick to avoid overflow/underflow
-    max_log = -1e9  # 매우 작은 수
+    max_log = -1e15  # 매우 작은 수
     for i in range(n_particles):
         if weights_unnorm[i] > max_log:
             max_log = weights_unnorm[i]
@@ -282,13 +282,13 @@ class ParticleFilter:
 
         # Motion Parameters
         #self.motion_alphas = np.array([0.1, 0.1, 0.05, 0.1, 0.07, 0.1], dtype=np.float32)
-        self.motion_alphas = np.array([0.9, 0.9, 0.04, 0.09, 0.06, 0.09], dtype=np.float32)
-        self.min_motion_noise = np.array([0.01, 0.01, 0.015], dtype=np.float32)
+        self.motion_alphas = np.array([0.09, 0.09, 0.06, 0.09, 0.06, 0.09], dtype=np.float32)
+        self.min_motion_noise = np.array([0.05, 0.05, 0.05], dtype=np.float32)
 
         self.last_estimated_pose = None
 
         # Sensor Model Parameters
-        self.sensor_sigma = 0.18
+        self.sensor_sigma = 0.3
         self.sensor_model_factor = -0.5 / (self.sensor_sigma ** 2)
         self.dist_threshold = self.sensor_sigma * 3
 
@@ -469,7 +469,7 @@ class ParticleFilter:
         n_eff = 1.0 / np.sum(self.weights ** 2)
 
         resampled = False
-        if n_eff < self.num_particles / 2.0:
+        if n_eff < self.num_particles / 1.5:
             self.resample()
             resampled = True
 
