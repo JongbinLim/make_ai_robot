@@ -2,11 +2,7 @@
 
 """
 ROS2 Odom Localizer Node with Robust UKF Fusion & Pre-integration
-[Version 2.2 - Improved TF Stability & Error Handling]
-- Added Numba Warm-up to prevent initial lag
-- ICP returns fitness score to reject bad matches
-- TF publishing synchronized with high-frequency IMU
-- Robust checks for NaN/Inf values
+[Version 2.3 - Fixed Grid Indexing, Cholesky Stability, and Numba Safety]
 """
 
 import rclpy
@@ -14,7 +10,6 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from rclpy.callback_groups import MutuallyExclusiveCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
-from geometry_msgs.msg import TransformStamped
 from sensor_msgs.msg import LaserScan, Imu
 from tf2_ros import TransformBroadcaster
 import tf_transformations
@@ -23,9 +18,10 @@ from collections import deque
 from bisect import bisect_left
 from threading import Lock
 from filterpy.kalman import UnscentedKalmanFilter, MerweScaledSigmaPoints
+from geometry_msgs.msg import TransformStamped, Twist
 
 # --- Numba Imports ---
-from numba import njit, float64, int32
+from numba import njit, prange
 
 
 # ==========================================
@@ -39,64 +35,169 @@ def normalize_angle_jit(angle):
 
 
 @njit(cache=True, fastmath=True)
-def deskew_scan_numba(ranges, angle_min, angle_increment,
-                      range_min, range_max, time_increment, angular_velocity):
+def compute_distribution_numba(points):
     """
-    Vectorized & JIT-compiled Lidar Deskewing
+    Compute PCA of the point cloud to determine direction and spread.
+    """
+    n = len(points)
+    if n < 10:
+        return False, np.zeros(2), np.eye(2)
+
+    mean_x = 0.0
+    mean_y = 0.0
+    for i in range(n):
+        mean_x += points[i, 0]
+        mean_y += points[i, 1]
+    mean_x /= n
+    mean_y /= n
+
+    cov_xx = 0.0
+    cov_xy = 0.0
+    cov_yy = 0.0
+    for i in range(n):
+        dx = points[i, 0] - mean_x
+        dy = points[i, 1] - mean_y
+        cov_xx += dx * dx
+        cov_xy += dx * dy
+        cov_yy += dy * dy
+
+    cov_xx /= n
+    cov_xy /= n
+    cov_yy /= n
+
+    cov_matrix = np.array([[cov_xx, cov_xy],
+                           [cov_xy, cov_yy]])
+
+    # w[0] = min, w[1] = max
+    w, v = np.linalg.eigh(cov_matrix)
+    return True, w, v
+
+
+@njit(cache=True, fastmath=True)
+def deskew_scan_numba(ranges, angle_min, angle_increment,
+                      range_min, range_max, time_increment, angular_velocity, linear_velocity):
+    """
+    Vectorized & JIT-compiled Lidar Deskewing with strict NaN/Inf checks
     """
     n = len(ranges)
     points = np.empty((n, 2), dtype=np.float64)
     valid_count = 0
 
+    # Pre-calculate constants
+    inv_omega = 0.0
+    if abs(angular_velocity) > 1e-4:
+        inv_omega = 1.0 / angular_velocity
+
     for i in range(n):
         r = ranges[i]
+        # Strict range and validity check
         if r < range_min or r > range_max or np.isnan(r) or np.isinf(r):
             continue
 
-        theta_base = angle_min + i * angle_increment
         dt = i * time_increment
-        theta_corrected = theta_base + (angular_velocity * dt)
+        delta_theta = angular_velocity * dt
 
-        points[valid_count, 0] = r * np.cos(theta_corrected)
-        points[valid_count, 1] = r * np.sin(theta_corrected)
+        robot_dx = 0.0
+        robot_dy = 0.0
+
+        if abs(angular_velocity) < 1e-4:
+            robot_dx = linear_velocity * dt
+        else:
+            # Arc motion model
+            radius = linear_velocity * inv_omega
+            robot_dx = radius * np.sin(delta_theta)
+            robot_dy = radius * (1 - np.cos(delta_theta))
+
+        theta_base = angle_min + i * angle_increment
+        theta_corrected = theta_base + delta_theta
+
+        points[valid_count, 0] = r * np.cos(theta_corrected) + robot_dx
+        points[valid_count, 1] = r * np.sin(theta_corrected) + robot_dy
         valid_count += 1
 
     return points[:valid_count]
 
 
 @njit(cache=True, fastmath=True)
-def get_nearest_neighbors(src, dst, max_dist_sq):
+def build_grid_map(points, resolution=0.025, pad=2.0):
     """
-    Find nearest neighbors using brute-force
-    Returns: (distances_squared, indices)
+    Build a 2D lookup grid.
+    [FIX] Added boundary clamping to prevent IndexError when point is exactly at max_x.
     """
+    if len(points) == 0:
+        return np.full((1, 1), -1, dtype=np.int32), np.zeros(2, dtype=np.float64), 1, 1
+
+    min_x = np.min(points[:, 0]) - pad
+    min_y = np.min(points[:, 1]) - pad
+    max_x = np.max(points[:, 0]) + pad
+    max_y = np.max(points[:, 1]) + pad
+
+    width = int(np.ceil((max_x - min_x) / resolution))
+    height = int(np.ceil((max_y - min_y) / resolution))
+
+    # Safety clamp for width/height to avoid zero size
+    width = max(width, 1)
+    height = max(height, 1)
+
+    grid = np.full((width, height), -1, dtype=np.int32)
+    inv_res = 1.0 / resolution
+
+    for i in range(len(points)):
+        gx = int((points[i, 0] - min_x) * inv_res)
+        gy = int((points[i, 1] - min_y) * inv_res)
+
+        # [CRITICAL FIX] Clamp indices to valid range
+        if gx >= width: gx = width - 1
+        if gy >= height: gy = height - 1
+        if gx < 0: gx = 0
+        if gy < 0: gy = 0
+
+        grid[gx, gy] = i
+
+    min_xy = np.array([min_x, min_y], dtype=np.float64)
+    return grid, min_xy, width, height
+
+
+@njit(cache=True, fastmath=True, parallel=True)
+def get_correspondences_grid(src, dst, grid, min_xy, grid_shape, resolution, max_dist_sq):
     n_src = src.shape[0]
-    n_dst = dst.shape[0]
+    indices = np.full(n_src, -1, dtype=np.int32)
+    dists = np.zeros(n_src, dtype=np.float64)
 
-    indices = np.empty(n_src, dtype=np.int32)
-    dists = np.empty(n_src, dtype=np.float64)
+    grid_w, grid_h = grid_shape
+    min_x, min_y = min_xy[0], min_xy[1]
+    inv_res = 1.0 / resolution
 
-    for i in range(n_src):
-        min_d2 = 1e9
-        min_idx = -1
-        p_x = src[i, 0]
-        p_y = src[i, 1]
+    search_radius = 4  # 0.05m * 4 = 20cm 범위 탐색
 
-        for j in range(n_dst):
-            dx = p_x - dst[j, 0]
-            dy = p_y - dst[j, 1]
-            d2 = dx * dx + dy * dy
+    for i in prange(n_src):
+        px = src[i, 0]
+        py = src[i, 1]
 
-            if d2 < min_d2:
-                min_d2 = d2
-                min_idx = j
+        gx = int((px - min_x) * inv_res)
+        gy = int((py - min_y) * inv_res)
 
-        if min_d2 > max_dist_sq:
-            indices[i] = -1  # Invalid
-            dists[i] = min_d2
-        else:
-            indices[i] = min_idx
-            dists[i] = min_d2
+        best_dist = max_dist_sq
+        best_idx = -1
+
+        # Check neighbor grids
+        for dx in range(-search_radius, search_radius + 1):
+            for dy in range(-search_radius, search_radius + 1):
+                nx, ny = gx + dx, gy + dy
+
+                if 0 <= nx < grid_w and 0 <= ny < grid_h:
+                    candidate_idx = grid[nx, ny]
+                    if candidate_idx != -1:
+                        dx_real = px - dst[candidate_idx, 0]
+                        dy_real = py - dst[candidate_idx, 1]
+                        d2 = dx_real * dx_real + dy_real * dy_real
+
+                        if d2 < best_dist:
+                            best_dist = d2
+                            best_idx = candidate_idx
+
+        dists[i] = best_dist
+        indices[i] = best_idx
 
     return dists, indices
 
@@ -113,15 +214,11 @@ def compute_transform_svd(src, dst):
     dst_mean_x = np.sum(dst[:, 0]) / n
     dst_mean_y = np.sum(dst[:, 1]) / n
 
-    src_centered = src.copy()
-    dst_centered = dst.copy()
+    # Centering (Avoid making full copies if possible, but Numba optimizes this)
+    src_c = src - np.array([src_mean_x, src_mean_y])
+    dst_c = dst - np.array([dst_mean_x, dst_mean_y])
 
-    src_centered[:, 0] -= src_mean_x
-    src_centered[:, 1] -= src_mean_y
-    dst_centered[:, 0] -= dst_mean_x
-    dst_centered[:, 1] -= dst_mean_y
-
-    H = src_centered.T @ dst_centered
+    H = src_c.T @ dst_c
     U, S, Vt = np.linalg.svd(H)
     R = Vt.T @ U.T
 
@@ -135,37 +232,37 @@ def compute_transform_svd(src, dst):
     return R, t_x, t_y
 
 
-@njit(cache=True)
-def icp_2d_numba(previous_pcd, current_pcd, max_iterations=30, tolerance=1e-4, distance_threshold=0.5):
+@njit(cache=True, fastmath=True, nogil=True)
+def icp_2d_grid_numba(previous_pcd, current_pcd, grid, min_xy, grid_shape, max_iterations=30, tolerance=1e-3, distance_threshold=0.5):
     """
-    Numba Optimized ICP Algorithm
-    Returns:
-        H: 3x3 Transformation Matrix (homogeneous)
-        fitness_score: Mean Squared Error (lower is better)
+    Optimized ICP using Grid Look-up.
     """
     H = np.eye(3, dtype=np.float64)
     src = current_pcd.copy()
     dst = previous_pcd
+
     dist_th_sq = distance_threshold ** 2
     prev_error = 1e9
-
     final_mse = 1e9
 
     for _ in range(max_iterations):
-        dists, indices = get_nearest_neighbors(src, dst, dist_th_sq)
+        dists, indices = get_correspondences_grid(
+            src, dst, grid, min_xy, grid_shape, 0.05, dist_th_sq
+        )
+
         valid_mask = indices != -1
         valid_cnt = np.sum(valid_mask)
 
         if valid_cnt < 10:
             return np.eye(3, dtype=np.float64), 9999.0
 
+        # [CRITICAL] Boolean indexing in Numba works, ensuring only valid points are used
         src_valid = src[valid_mask]
         dst_valid = dst[indices[valid_mask]]
 
-        # Compute Transform
         R, tx, ty = compute_transform_svd(src_valid, dst_valid)
 
-        # Apply to src
+        # Apply to src (In-place update for next iteration)
         src_new_x = R[0, 0] * src[:, 0] + R[0, 1] * src[:, 1] + tx
         src_new_y = R[1, 0] * src[:, 0] + R[1, 1] * src[:, 1] + ty
         src[:, 0] = src_new_x
@@ -178,7 +275,6 @@ def icp_2d_numba(previous_pcd, current_pcd, max_iterations=30, tolerance=1e-4, d
         T_step[1, 2] = ty
         H = T_step @ H
 
-        # Check Convergence
         current_mse = np.sum(dists[valid_mask]) / valid_cnt
         final_mse = current_mse
 
@@ -198,23 +294,26 @@ def quaternion_from_euler(roll, pitch, yaw):
 
 
 class RobotUKF:
-    def __init__(self, dt=0.01, Q_params=None, R_icp_params=None, R_imu_params=None):
+    def __init__(self, dt=0.05, Q_params=None, R_icp_params=None, R_imu_params=None):
+        # [TUNING] kappa=0 for dim=5 is generally safe.
         points = MerweScaledSigmaPoints(n=5, alpha=0.1, beta=2., kappa=0)
         self.ukf = UnscentedKalmanFilter(dim_x=5, dim_z=3, dt=dt, fx=self.fx, hx=self.hx, points=points)
 
         self.ukf.x = np.zeros(5)
         self.ukf.P = np.eye(5) * 0.1
 
-        q_diag = Q_params if Q_params else [0.001, 0.001, 0.001, 0.05, 0.05]
-        self.ukf.Q = np.diag(q_diag)
+        self.dt_default = dt
+        q_diag = Q_params if Q_params else [0.001, 0.001, 0.001, 0.01, 0.05]
+        self.Q_base = np.diag(q_diag)
+        self.ukf.Q = self.Q_base.copy()
 
         r_icp_diag = R_icp_params if R_icp_params else [0.05, 0.05, 0.02]
         self.R_icp_base = np.diag(r_icp_diag)
-        self.R_icp = self.R_icp_base.copy()
 
-        r_imu_diag = R_imu_params if R_imu_params else [0.01]
+        r_imu_diag = R_imu_params if R_imu_params else [0.02]
         self.R_imu = np.diag(r_imu_diag)
 
+        # Assign mean functions
         self.ukf.x_mean = self.state_mean
         self.ukf.z_mean = self.measurement_mean
         self.ukf.residual_x = self.residual_x
@@ -245,8 +344,16 @@ class RobotUKF:
             z[0] = np.dot(sigmas[:, 0], Wm)
         return z
 
-    def fx(self, x, dt):
+    def fx(self, x, dt, u):
         theta, v, omega = x[2], x[3], x[4]
+        cmd_v, cmd_omega = u[0], u[1]
+
+        # Control input mixing
+        alpha_v = 0.1 # 튜닝!
+        alpha_w = 0.0 # 튜닝!
+        next_v = v + alpha_v * (cmd_v - v)
+        next_omega = omega + alpha_w * (cmd_omega - omega)
+
         if abs(omega) > 1e-5:
             s_t = np.sin(theta)
             c_t = np.cos(theta)
@@ -255,13 +362,12 @@ class RobotUKF:
             next_x = x[0] + (v / omega) * (s_t_next - s_t)
             next_y = x[1] + (v / omega) * (-c_t_next + c_t)
         else:
-            next_x = x[0] + v * np.cos(theta + omega * dt / 2) * dt
-            next_y = x[1] + v * np.sin(theta + omega * dt / 2) * dt
+            # 직진 주행 시 runge-kutta 2nd order 근사
+            next_x = x[0] + v * np.cos(theta + omega * dt * 0.5) * dt
+            next_y = x[1] + v * np.sin(theta + omega * dt * 0.5) * dt
 
         next_theta = normalize_angle_jit(theta + omega * dt)
-        # Decay helps stability when no input
-        next_v = v * 0.98
-        next_omega = omega * 0.95
+
         return np.array([next_x, next_y, next_theta, next_v, next_omega])
 
     def hx(self, x):
@@ -281,21 +387,77 @@ class RobotUKF:
             y[2] = normalize_angle_jit(y[2])
         return y
 
-    def predict(self, dt):
-        # Enforce symmetry
+    def predict(self, dt, u=np.zeros(2)):
+        # Force Symmetry to prevent non-positive definite errors
         self.ukf.P = (self.ukf.P + self.ukf.P.T) / 2.0
-        try:
-            self.ukf.predict(dt=dt)
-        except Exception:
-            self.ukf.P = np.eye(5) * 0.5
-            self.ukf.predict(dt=dt)
+        # Add small noise to diagonal to prevent non-positive definite
+        self.ukf.P += np.eye(5) * 1e-6
 
-    def update_icp(self, z, motion_factor=1.0):
-        self.R_icp = self.R_icp_base * motion_factor
-        self.ukf.update(z, R=self.R_icp, hx=self.hx)
+        if dt > 1e-6:
+            scale_factor = dt / self.dt_default
+            self.ukf.Q = self.Q_base * scale_factor
+        else:
+            self.ukf.Q = self.Q_base
+
+        try:
+            # Pass 'u' explicitly as kwarg, which filterpy passes to fx(x, dt, **kwargs)
+            self.ukf.predict(dt=dt, u=u)
+        except Exception as e:
+            print(f"[UKF Predict Error] {e} - Resetting P")
+            self.ukf.P = np.eye(5) * 0.1
+            self.ukf.predict(dt=dt, u=u)
+
+    def update_icp(self, z, eigenvalues, eigenvectors, motion_factor=1.0):
+        # Stabilize before update
+        self.ukf.P = (self.ukf.P + self.ukf.P.T) / 2.0
+
+        lambda_min = max(eigenvalues[0], 1e-6)
+        lambda_max = eigenvalues[1]
+        ratio = lambda_max / lambda_min
+
+        base_noise_x = self.R_icp_base[0, 0] * motion_factor
+        long_axis_scale = 1.0 + np.log1p(max(0, ratio - 3.0)) * 10.0
+        long_axis_scale = min(long_axis_scale, 100.0)
+
+        sigma_short = base_noise_x
+        sigma_long = base_noise_x * long_axis_scale
+
+        # Covariance in Principal Component Frame
+        R_pc_aligned = np.array([[sigma_short, 0.0],
+                                 [0.0, sigma_long]])
+
+        # Transform to Local Frame (Body)
+        R_local = eigenvectors @ R_pc_aligned @ eigenvectors.T
+
+        # Transform to Global Frame
+        current_yaw = self.ukf.x[2]
+        c, s = np.cos(current_yaw), np.sin(current_yaw)
+        R_rot = np.array([[c, -s],
+                          [s, c]])
+
+        R_global_2d = R_rot @ R_local @ R_rot.T
+
+        R_final = np.eye(3)
+        R_final[:2, :2] = R_global_2d
+        R_final[2, 2] = self.R_icp_base[2, 2] * motion_factor
+
+        # Ensure R is symmetric and positive definite
+        R_final = (R_final + R_final.T) / 2.0
+        R_final += np.eye(3) * 1e-6  # 측정 노이즈에도 아주 작은 값 추가
+
+        try:
+            self.ukf.update(z, R=R_final, hx=self.hx)
+        except np.linalg.LinAlgError:
+            print("[UKF Update Error] LinAlgError during ICP update. Skipping.")
+            return long_axis_scale  # Skip update but return scale for debug
+
+        return long_axis_scale
 
     def update_imu(self, omega):
-        self.ukf.update(np.array([omega]), R=self.R_imu, hx=self.hx_imu)
+        try:
+            self.ukf.update(np.array([omega]), R=self.R_imu, hx=self.hx_imu)
+        except np.linalg.LinAlgError:
+            pass
 
     def get_state(self):
         return self.ukf.x.copy()
@@ -312,13 +474,11 @@ class OdomLocalizerNode(Node):
         # Parameters
         self.declare_parameter('odom_frame', 'odom')
         self.declare_parameter('base_frame', 'base')
-        self.declare_parameter('keyframe_dist', 0.3)
-        self.declare_parameter('keyframe_angle', 0.3)
-
-        # Reduced noise for better stability
-        self.declare_parameter('ukf_process_noise', [0.001, 0.001, 0.001, 0.01, 0.01])
+        self.declare_parameter('keyframe_dist', 0.1)
+        self.declare_parameter('keyframe_angle', 0.1)
+        self.declare_parameter('ukf_process_noise', [0.001, 0.001, 0.001, 0.01, 0.05])
         self.declare_parameter('ukf_meas_noise_icp', [0.05, 0.05, 0.02])
-        self.declare_parameter('ukf_meas_noise_imu', [0.01])
+        self.declare_parameter('ukf_meas_noise_imu', [0.02])
 
         self.odom_frame = self.get_parameter('odom_frame').value
         self.base_frame = self.get_parameter('base_frame').value
@@ -326,7 +486,7 @@ class OdomLocalizerNode(Node):
         self.kf_angle_th = self.get_parameter('keyframe_angle').value
 
         self.ukf = RobotUKF(
-            dt=0.01,
+            dt=0.05,
             Q_params=self.get_parameter('ukf_process_noise').value,
             R_icp_params=self.get_parameter('ukf_meas_noise_icp').value,
             R_imu_params=self.get_parameter('ukf_meas_noise_imu').value
@@ -343,6 +503,12 @@ class OdomLocalizerNode(Node):
             LaserScan, '/scan', self.scan_callback, qos, callback_group=self.scan_cb_group)
         self.imu_sub = self.create_subscription(
             Imu, '/imu_plugin/out', self.imu_callback, qos, callback_group=self.imu_cb_group)
+        self.cmd_sub = self.create_subscription(
+            Twist, '/cmd_vel', self.cmd_vel_callback, 10)
+
+        self.current_cmd = np.zeros(2)
+        # Fix: Init with current time to avoid large dt on startup
+        self.last_cmd_time = self.get_clock().now().nanoseconds * 1e-9
 
         self.tf_broadcaster = TransformBroadcaster(self)
 
@@ -350,13 +516,16 @@ class OdomLocalizerNode(Node):
         self.imu_data = deque(maxlen=3000)
 
         self.keyframe_pcd = None
+        # Grid Map 캐싱용 변수
+        self.kf_grid = None
+        self.kf_min_xy = None
+        self.kf_grid_shape = None
+
         self.last_keyframe_time = None
         self.last_imu_time = None
         self.last_keyframe_pose = np.zeros(3)
 
-        # Warm up Numba to prevent lag on first callback
         self._warmup_numba()
-
         self.get_logger().info('Odom Localizer Ready (Numba Warm-up Complete)')
 
     def _warmup_numba(self):
@@ -364,13 +533,27 @@ class OdomLocalizerNode(Node):
         self.get_logger().info('Warming up Numba kernels...')
         dummy_scan = np.random.rand(50, 2).astype(np.float64)
         dummy_ranges = np.ones(50, dtype=np.float64)
-
-        # Warmup Deskew
-        deskew_scan_numba(dummy_ranges, -1.0, 0.01, 0.1, 10.0, 0.0, 0.1)
-
-        # Warmup ICP
-        icp_2d_numba(dummy_scan, dummy_scan)
+        deskew_scan_numba(dummy_ranges, -1.0, 0.01, 0.1, 10.0, 0.0, 0.1, 0.1)
+        dummy_grid, dummy_min_xy, w, h = build_grid_map(dummy_scan, resolution=0.025, pad=2.0)
+        dummy_grid_shape = (w, h)
+        icp_2d_grid_numba(dummy_scan, dummy_scan, dummy_grid, dummy_min_xy, dummy_grid_shape)
+        compute_distribution_numba(dummy_scan)
         self.get_logger().info('Warm-up Done.')
+
+    def get_time_sec(self, stamp_msg):
+        """ROS Time Msg를 float seconds로 안전하게 변환"""
+        # stamp_msg가 Time 객체인 경우와 msg.header.stamp인 경우 모두 처리
+        if hasattr(stamp_msg, 'sec'):
+            return float(stamp_msg.sec) + float(stamp_msg.nanosec) * 1e-9
+        else:
+            # rclpy.time.Time 객체인 경우
+            return stamp_msg.nanoseconds * 1e-9
+
+    def get_current_control(self):
+        now = self.get_clock().now().nanoseconds * 1e-9
+        if now - self.last_cmd_time > 0.5:
+            return np.zeros(2)
+        return self.current_cmd
 
     def get_interpolated_omega(self, query_time):
         with self.lock:
@@ -396,15 +579,16 @@ class OdomLocalizerNode(Node):
             idx_start = bisect_left(self.imu_times, t_start)
             idx_end = bisect_left(self.imu_times, t_end)
 
-            # Safe slice handling
             idx_start = max(0, idx_start)
             idx_end = min(len(self.imu_times) - 1, idx_end)
 
             if idx_start >= idx_end: return 0.0
 
+            # Safe conversion to list for slicing
             ts = list(self.imu_times)
             ws = list(self.imu_data)
 
+            # Ensure slice is valid
             sub_ts = np.array(ts[idx_start:idx_end + 1])
             sub_ws = np.array(ws[idx_start:idx_end + 1])
 
@@ -414,7 +598,7 @@ class OdomLocalizerNode(Node):
             avg_w = (sub_ws[:-1] + sub_ws[1:]) / 2.0
             return np.sum(avg_w * dt_arr)
 
-    def deskew_scan(self, scan_msg, angular_velocity):
+    def deskew_scan(self, scan_msg, angular_velocity, linear_velocity):
         ranges = np.array(scan_msg.ranges, dtype=np.float64)
         time_inc = scan_msg.time_increment
         if time_inc < 1e-9:
@@ -430,128 +614,203 @@ class OdomLocalizerNode(Node):
             float(scan_msg.range_min),
             float(scan_msg.range_max),
             float(time_inc),
-            float(angular_velocity)
+            float(angular_velocity),
+            float(linear_velocity)
         )
 
         if pcd.shape[0] < 30: return None
         return pcd
 
+    def cmd_vel_callback(self, msg):
+        self.current_cmd[0] = msg.linear.x
+        self.current_cmd[1] = msg.angular.z
+        self.last_cmd_time = self.get_clock().now().nanoseconds * 1e-9
+
+    def get_transform_matrix(self, x, y, theta):
+        c = np.cos(theta)
+        s = np.sin(theta)
+        return np.array([
+            [c, -s, x],
+            [s, c, y],
+            [0, 0, 1]
+        ])
+
     def scan_callback(self, msg):
-        """
-        Perform ICP Correction.
-        NOTE: Do NOT publish TF here. TF is published in IMU callback for smoothness.
-        """
         scan_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        # Get IMU data for deskewing
+        # UKF state access needs lock
+        with self.lock:
+            current_state = self.ukf.get_state()
+            current_v = self.ukf.get_state()[3]
+
         current_omega = self.get_interpolated_omega(scan_time)
-        current_pcd = self.deskew_scan(msg, current_omega)
+        current_pcd = self.deskew_scan(msg, current_omega, current_v)
 
-        if current_pcd is None:
-            return
+        if current_pcd is None: return
 
-        # Initialize Keyframe if needed
+        valid, eig_vals, eig_vecs = compute_distribution_numba(current_pcd)
+        if not valid: return
+
         if self.keyframe_pcd is None:
             self.keyframe_pcd = current_pcd
             self.last_keyframe_time = scan_time
-            # Init UKF pose to match parameter if needed, but usually starts at 0
-            self.last_keyframe_pose = self.ukf.get_state()[:3]
+            # Grid 미리 빌드 (여기서 딱 한 번)
+            self.kf_grid, self.kf_min_xy, w, h = build_grid_map(self.keyframe_pcd, resolution=0.025, pad=2.0)
+            self.kf_grid_shape = (w, h)
+            with self.lock:
+                self.last_keyframe_pose = self.ukf.get_state()[:3]
             return
 
-        # Pre-integration for initial guess
+        dt_kf = scan_time - self.last_keyframe_time
+        if dt_kf <= 0: return  # Prevent backward time issues
+
         imu_delta_yaw = self.integrate_imu_yaw(self.last_keyframe_time, scan_time)
-        c, s = np.cos(imu_delta_yaw), np.sin(imu_delta_yaw)
-        R_guess = np.array([[c, -s], [s, c]])
 
-        current_pcd_rotated = (R_guess @ current_pcd.T).T
+        pred_v = current_v
 
-        # --- Numba Accelerated ICP ---
+        dist_pred = pred_v * dt_kf
+        dx_pred = dist_pred * np.cos(imu_delta_yaw / 2.0)  # 단순 근사
+        dy_pred = dist_pred * np.sin(imu_delta_yaw / 2.0)
+
+        # 예측된 상대 변환 행렬 (T_pred)
+        # Keyframe 좌표계 기준에서 Current Frame이 어디에 있을지 예측
+        T_pred = np.eye(3)
+        c_i, s_i = np.cos(imu_delta_yaw), np.sin(imu_delta_yaw)
+        T_pred[0, 0], T_pred[0, 1] = c_i, -s_i
+        T_pred[1, 0], T_pred[1, 1] = s_i, c_i
+        T_pred[0, 2] = dx_pred
+        T_pred[1, 2] = dy_pred
+
+        R_pred = T_pred[:2, :2]
+        t_pred = T_pred[:2, 2]
+
+        current_pcd_transformed = (R_pred @ current_pcd.T).T + t_pred
+
         try:
-            H_icp, fitness_score = icp_2d_numba(
+            H_icp, fitness_score = icp_2d_grid_numba(
                 previous_pcd=self.keyframe_pcd,
-                current_pcd=current_pcd_rotated,
-                max_iterations=40,
-                tolerance=1e-5,
+                current_pcd=current_pcd_transformed,
+                grid=self.kf_grid,
+                min_xy=self.kf_min_xy,
+                grid_shape=self.kf_grid_shape,
+                max_iterations=25,
+                tolerance=1e-3,
                 distance_threshold=0.5
             )
         except Exception as e:
             self.get_logger().warn(f"ICP Error: {e}")
             return
 
-        # Simple Gate: Reject bad matches (e.g., dynamic obstacles, featureless corridors)
-        if fitness_score > 0.1:  # Threshold depends on map scale/resolution
-            self.get_logger().debug(f"ICP Rejected: High MSE {fitness_score:.4f}")
+        if fitness_score > 0.15:
+            # ICP 매칭은 실패했더라도, 로봇이 Keyframe에서 너무 멀어졌다면(예: 10cm 이상)
+            # 현재 위치(UKF 예측값)를 기준으로 Keyframe을 강제 갱신해야 함.
+            # 그렇지 않으면 10m를 이동해도 계속 10m 전의 Keyframe과 매칭을 시도하다 영원히 실패함.
+            with self.lock:
+                current_state_pred = self.ukf.get_state()
+
+            # 예측된 위치와 마지막 Keyframe 사이의 거리 계산
+            pred_dx = current_state_pred[0] - self.last_keyframe_pose[0]
+            pred_dy = current_state_pred[1] - self.last_keyframe_pose[1]
+            pred_dist_sq = pred_dx ** 2 + pred_dy ** 2
+
+            # 기준 거리(kf_dist_th)보다 많이 이동했으면 강제 갱신
+            if pred_dist_sq > self.kf_dist_th ** 2:
+                self.get_logger().warn(
+                    f"ICP Failed (Score: {fitness_score:.3f}) but moved far. Forcing Keyframe Update.")
+                self.keyframe_pcd = current_pcd
+                self.last_keyframe_time = scan_time
+                self.last_keyframe_pose = current_state_pred[:3]
+
+                # Grid Map도 갱신
+                self.kf_grid, self.kf_min_xy, w, h = build_grid_map(self.keyframe_pcd, resolution=0.025, pad=2.0)
+                self.kf_grid_shape = (w, h)
             return
 
-        dx_res = H_icp[0, 2]
-        dy_res = H_icp[1, 2]
-        dtheta_res = np.arctan2(H_icp[1, 0], H_icp[0, 0])
+        # 3x3 행렬 곱셈으로 최종 상대 변환 계산
+        T_total = H_icp @ T_pred
 
-        dtheta_total = normalize_angle_jit(imu_delta_yaw + dtheta_res)
-        dx_total = dx_res
-        dy_total = dy_res
+        dx_total = T_total[0, 2]
+        dy_total = T_total[1, 2]
+        dtheta_total = np.arctan2(T_total[1, 0], T_total[0, 0])
 
-        # Calculate Global Measurement based on Keyframe
+        # Global Frame에서의 측정치 계산
         kf_x, kf_y, kf_th = self.last_keyframe_pose
-        c_k, s_k = np.cos(kf_th), np.sin(kf_th)
+        T_keyframe_global = self.get_transform_matrix(kf_x, kf_y, kf_th)
 
-        meas_x = kf_x + (c_k * dx_total - s_k * dy_total)
-        meas_y = kf_y + (s_k * dx_total + c_k * dy_total)
-        meas_theta = normalize_angle_jit(kf_th + dtheta_total)
+        # T_current_global = T_keyframe_global * T_total
+        T_meas_global = T_keyframe_global @ T_total
+
+        meas_x = T_meas_global[0, 2]
+        meas_y = T_meas_global[1, 2]
+        meas_theta = np.arctan2(T_meas_global[1, 0], T_meas_global[0, 0])
 
         measurement = np.array([meas_x, meas_y, meas_theta])
 
-        # Update UKF
         with self.lock:
-            # Adaptive noise based on angular velocity (turning is harder)
-            motion_factor = 1.0 + 3.0 * abs(current_omega)
-            self.ukf.update_icp(measurement, motion_factor=motion_factor)
+            now_sec = self.get_clock().now().nanoseconds / 1e9
+            lag_time = now_sec - scan_time
+
+            # lag_time이 음수(미래에서 옴)거나 1초 이상 차이나면 시계가 안 맞는 것으로 간주
+            if lag_time < 0.0 or lag_time > 1.0:
+                # 로깅을 한 번만 하거나 디버그로 낮추는 것이 좋음
+                self.get_logger().debug(f"Time sync warning: lag={lag_time:.4f}s. Forcing lag to 0.")
+                lag_time = 0.0
+
+            # Lag가 클수록 측정치 노이즈를 키움 (Trust less if laggy)
+            lag_penalty = 1.0 + (lag_time * 5.0)
+            lag_penalty = min(max(lag_penalty, 1.0), 10.0)
+
+            motion_factor = 1.0 + 3.0 * abs(current_omega) + 2.0 * abs(current_v) * lag_penalty
+
+            # UKF Update
+            self.ukf.update_icp(
+                measurement,
+                eigenvalues=eig_vals,
+                eigenvectors=eig_vecs,
+                motion_factor=motion_factor
+            )
 
             current_state = self.ukf.get_state()
 
-            # Keyframe Update Decision
             dist_sq = dx_total ** 2 + dy_total ** 2
             if dist_sq > self.kf_dist_th ** 2 or abs(dtheta_total) > self.kf_angle_th:
                 self.keyframe_pcd = current_pcd
                 self.last_keyframe_time = scan_time
                 self.last_keyframe_pose = current_state[:3]
+                # Keyframe이 바뀌었으니 Grid도 새로 빌드
+                self.kf_grid, self.kf_min_xy, w, h = build_grid_map(self.keyframe_pcd, resolution=0.025, pad=2.0)
+                self.kf_grid_shape = (w, h)
 
     def imu_callback(self, msg):
-        """
-        High-rate Prediction & TF Publishing
-        """
         current_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         omega = msg.angular_velocity.z
+        u = self.get_current_control()
 
         with self.lock:
-            self.imu_times.append(current_time)
-            self.imu_data.append(omega)
-
             if self.last_imu_time is None:
                 self.last_imu_time = current_time
+                self.imu_times.append(current_time)
+                self.imu_data.append(omega)
                 return
 
             dt = current_time - self.last_imu_time
-            if dt <= 0: return
 
-            # Predict UKF
-            # If DT is too large (lag), break it down
-            if dt > 0.1:
-                step = 0.05
-                remain = dt
-                while remain > 0:
-                    d = min(step, remain)
-                    self.ukf.predict(d)
-                    remain -= d
-            else:
-                self.ukf.predict(dt)
+            # Filter bad timestamps
+            if dt <= 0:
+                return
 
-            # Update IMU (treat as measurement for omega state)
+            self.imu_times.append(current_time)
+            self.imu_data.append(omega)
+
+            MAX_STEP = 0.05
+            remain = dt
+            while remain > 1e-6:
+                d = min(MAX_STEP, remain)
+                self.ukf.predict(dt=d, u=u)
+                remain -= d
+
             self.ukf.update_imu(omega)
-
-            # Publish TF immediately with current IMU timestamp
             self.publish_tf(msg.header.stamp)
-
             self.last_imu_time = current_time
 
     def publish_tf(self, timestamp):
@@ -565,9 +824,9 @@ class OdomLocalizerNode(Node):
         t.transform.translation.y = float(state[1])
         t.transform.translation.z = 0.0
 
-        # Explicit Normalization of Quaternion
         q = quaternion_from_euler(0, 0, state[2])
-        norm = np.sqrt(q[0] ** 2 + q[1] ** 2 + q[2] ** 2 + q[3] ** 2)
+        # Safe normalization
+        norm = np.sqrt(np.sum(np.array(q) ** 2))
         if norm > 1e-6:
             q = q / norm
         else:
@@ -584,8 +843,6 @@ class OdomLocalizerNode(Node):
 def main(args=None):
     rclpy.init(args=args)
     node = OdomLocalizerNode()
-
-    # Use MultiThreadedExecutor to handle Scan(ICP) and IMU(High-rate) concurrently
     executor = MultiThreadedExecutor(num_threads=4)
     executor.add_node(node)
 
