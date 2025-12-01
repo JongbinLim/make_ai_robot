@@ -29,6 +29,7 @@ from tf2_ros import TransformBroadcaster, Buffer, TransformListener, LookupExcep
     ExtrapolationException
 import tf_transformations
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy
+from rclpy.duration import Duration
 
 import numpy as np
 
@@ -63,8 +64,8 @@ class GlobalLocalizerNode(Node):
         self.declare_parameter('initial_pose_roll', 0.0)
         self.declare_parameter('initial_pose_pitch', 0.0)
         self.declare_parameter('initial_pose_yaw', 0.0)
-        self.declare_parameter('min_particles', 300)
-        self.declare_parameter('max_particles', 1000)
+        self.declare_parameter('min_particles', 500)
+        self.declare_parameter('max_particles', 2000)
 
         self.init_x = self.get_parameter('initial_pose_x').value
         self.init_y = self.get_parameter('initial_pose_y').value
@@ -134,11 +135,11 @@ class GlobalLocalizerNode(Node):
 
     def initial_pose_callback(self, msg):
         """RViz 등에서 초기 위치를 재설정할 때 호출됩니다."""
-        x = msg.pose.position.x
-        y = msg.pose.position.y
+        x = msg.pose.pose.position.x
+        y = msg.pose.pose.position.y
 
         # Quaternion to Euler (Yaw)
-        q = msg.pose.orientation
+        q = msg.pose.pose.orientation
         _, _, yaw = tf_transformations.euler_from_quaternion([q.x, q.y, q.z, q.w])
 
         self.get_logger().info(f'Relocalizing to x:{x:.2f}, y:{y:.2f}, yaw:{yaw:.2f}')
@@ -153,7 +154,7 @@ class GlobalLocalizerNode(Node):
         except (LookupException, ConnectivityException, ExtrapolationException):
             try:
                 # 실패 시 가장 최신 시간 조회
-                trans = self.tf_buffer.lookup_transform('odom', 'base', Time())
+                trans = self.tf_buffer.lookup_transform('odom', 'base', rclpy.time.Time())
                 return transform_to_matrix(trans.transform)
             except Exception as e:
                 self.get_logger().debug(f'TF lookup completely failed: {e}')
@@ -203,7 +204,7 @@ class GlobalLocalizerNode(Node):
             _, _, dyaw = tf_transformations.euler_from_matrix(T_delta)
 
             # 이동량이 매우 작으면 필터 업데이트 스킵
-            if abs(dx) > 0.001 or abs(dy) > 0.001 or abs(dyaw) > 0.001:
+            if abs(dx) > 0.0001 or abs(dy) > 0.0001 or abs(dyaw) > 0.0001:
                 # 파티클 필터 예측 단계 실행
                 self.pf.predict(dx, dy, dyaw)
                 do_update = True
