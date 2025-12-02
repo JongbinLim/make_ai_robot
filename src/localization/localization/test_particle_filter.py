@@ -107,7 +107,7 @@ def run_simulation():
     mock_map_msg, map_grid = create_test_map(map_w_m, map_h_m, res)
 
     # Particle Filter 초기화
-    pf = ParticleFilter(min_particles=200, max_particles=1000, initial_noise=[0.1, 0.1, 0.1])
+    pf = ParticleFilter(min_particles=300, max_particles=3000, initial_noise=[0.1, 0.1, 0.1])
     pf.set_map(mock_map_msg)
 
     # 시작 위치
@@ -215,9 +215,6 @@ def run_simulation():
         # 센서 데이터 생성 및 업데이트
         fake_scan = get_true_scan(true_pose, map_w_m, map_h_m, scan_angles)
         pf.update(fake_scan, scan_angle_min, scan_angle_inc)
-
-        # [수정] 재샘플링 추가 (가장 중요! 이게 없으면 수렴 안 함)
-        pf.resample()
 
         est_pose = pf.get_estimated_pose()
 
