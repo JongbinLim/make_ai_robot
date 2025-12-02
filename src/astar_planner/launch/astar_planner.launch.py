@@ -54,6 +54,12 @@ def generate_launch_description():
         description='Safety margin around obstacles in meters'
     )
 
+    use_yaw_aligner_arg = DeclareLaunchArgument(
+        'use_yaw_aligner',
+        default_value='true',
+        description='Run yaw_aligner to handle in-place rotation at goal'
+    )
+
     # Simulator Node
     simulator_node = Node(
         package='astar_planner',
@@ -77,8 +83,15 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'resolution': LaunchConfiguration('resolution'),
-            'obstacle_margin': LaunchConfiguration('obstacle_margin'),
         }]
+    )
+
+    yaw_aligner_node = Node(
+        package='astar_planner',
+        executable='yaw_aligner.py',
+        name='yaw_aligner',
+        output='screen',
+        condition=IfCondition(LaunchConfiguration('use_yaw_aligner'))
     )
     
     # RViz Node
@@ -100,8 +113,9 @@ def generate_launch_description():
         use_rviz_arg,
         use_gazebo_arg,
         obstacle_margin_arg,
+        use_yaw_aligner_arg,
         #simulator_node,
         path_planner_node,
+        yaw_aligner_node,
         rviz_node,
     ])
-

@@ -12,8 +12,9 @@ namespace astar_planner
 AStar::AStar()
 : map_width_(0),
   map_height_(0),
-  max_penalty_(20.0),              // 장애물 바로 옆 penalty
-  max_influence_dist_cells_(8.0)   // 장애물에서 8셀까지 penalty 영향
+  max_penalty_(20.0),     // 장애물 바로 옆 penalty
+  influence_range_m_(1.5),// ★ 장애물에서 1.0m까지 penalty (원하면 여기 튜닝)
+  resolution_m_(1.0)      // 기본값, 실제 값은 setResolution에서 넣어줌
 {
 }
 
@@ -21,11 +22,22 @@ AStar::~AStar()
 {
 }
 
+void AStar::setResolution(double resolution_m)
+{
+  if (resolution_m > 0.0) {
+    resolution_m_ = resolution_m;
+  } else {
+    resolution_m_ = 1.0;
+    std::cerr << "[AStar] WARNING: non-positive resolution, defaulting to 1.0 m/셀"
+              << std::endl;
+  }
+}
+
 void AStar::setMap(const std::vector<std::vector<int>> & map)
 {
   // map 값 의미:
   // 0 = free
-  // 1 = margin zone (soft cost 영역, 통과 가능하지만 penalty 부과)
+  // 1 = margin zone (soft cost 영역, 통과 가능하지만 penalty 부과 X)
   // 2 = real obstacle (통과 불가)
   map_ = map;
   if (!map_.empty()) {
@@ -89,7 +101,7 @@ void AStar::setMap(const std::vector<std::vector<int>> & map)
 
 double AStar::calculateHeuristic(const GridCell & a, const GridCell & b) const
 {
-  // Euclidean distance
+  // Euclidean distance (grid 상에서의 거리, A* 탐색용)
   double dx = static_cast<double>(a.x - b.x);
   double dy = static_cast<double>(a.y - b.y);
   return std::sqrt(dx * dx + dy * dy);
@@ -228,17 +240,20 @@ std::vector<GridCell> AStar::findPath(const GridCell & start, const GridCell & g
         dist_cells = distance_map_[neighbor.y][neighbor.x];
       }
 
+      // dist_cells [cell] → dist_m [m]
+      double dist_m = std::numeric_limits<double>::infinity();
       if (std::isfinite(dist_cells)) {
-        // 장애물에서 max_influence_dist_cells_ 셀 이내만 penalty 적용
-        if (dist_cells < max_influence_dist_cells_) {
-          // dist = 0일 때 max_penalty_,
-          // dist = max_influence_dist_cells_ 일 때 0 이 되도록 선형 스케일
-          double w = (max_influence_dist_cells_ - dist_cells) / max_influence_dist_cells_;
-          if (w < 0.0) {
-            w = 0.0;
-          }
-          penalty = max_penalty_ * w;
+        dist_m = dist_cells * resolution_m_;
+      }
+
+      if (std::isfinite(dist_m) && dist_m < influence_range_m_) {
+        // dist_m = 0일 때 max_penalty_,
+        // dist_m = influence_range_m_ 일 때 0 이 되도록 선형 스케일
+        double w = (influence_range_m_ - dist_m) / influence_range_m_;
+        if (w < 0.0) {
+          w = 0.0;
         }
+        penalty = max_penalty_ * w;
       }
 
       double tentative_g = current.g_cost + movement_cost + penalty;

@@ -14,6 +14,7 @@
 #include "geometry_msgs/msg/point.hpp"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include "nav_msgs/msg/path.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 
@@ -90,15 +91,20 @@ class PathPlannerNode : public rclcpp::Node
 {
 public:
   PathPlannerNode()
-  : Node("path_planner_node")
+  : Node("path_planner_node"),
+    planning_resolution_m_(0.25),  // default coarse resolution for faster planning
+    goal_yaw_(0.0),
+    downsample_factor_(1),
+    effective_resolution_m_(1.0)
   {
     // Declare parameters
     this->declare_parameter<double>("resolution", 1.0);
-    // 장애물 주변 margin [m] (soft cost 영역)
-    this->declare_parameter<double>("obstacle_margin", 0.3);
+    this->declare_parameter<double>("obstacle_margin", 0.0);
+    this->declare_parameter<double>("planning_resolution", planning_resolution_m_);
 
     resolution_ = this->get_parameter("resolution").as_double();
     obstacle_margin_m_ = this->get_parameter("obstacle_margin").as_double();
+    planning_resolution_m_ = this->get_parameter("planning_resolution").as_double();
 
     // Dynamic parameter change callback
     param_callback_handle_ = this->add_on_set_parameters_callback(
@@ -129,12 +135,47 @@ public:
     path_pub_ = this->create_publisher<nav_msgs::msg::Path>("/local_path", 10);
     viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/path_markers", 10);
     goal_marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/goal_marker", 10);
+    goal_reached_pub_ = this->create_publisher<std_msgs::msg::Bool>("/goal_reached", 10);
 
     RCLCPP_INFO(this->get_logger(), "Path Planner Node initialized");
     RCLCPP_INFO(this->get_logger(), "Use RViz2 '2D Goal Pose' tool to set a goal");
   }
 
 private:
+  // ======================
+  // Quaternion ↔ yaw 변환 helper
+  // ======================
+  double quaternionToYaw(const geometry_msgs::msg::Quaternion & q)
+  {
+    double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+    double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+    return std::atan2(siny_cosp, cosy_cosp);
+  }
+
+  geometry_msgs::msg::Quaternion yawToQuaternion(double yaw)
+  {
+    geometry_msgs::msg::Quaternion q;
+    q.x = 0.0;
+    q.y = 0.0;
+    q.z = std::sin(yaw / 2.0);
+    q.w = std::cos(yaw / 2.0);
+    return q;
+  }
+
+  double normalizeAngle(double a)
+  {
+    const double PI = 3.14159265358979323846;
+    const double TWO_PI = 2.0 * PI;
+    while (a > PI)  { a -= TWO_PI; }
+    while (a < -PI) { a += TWO_PI; }
+    return a;
+  }
+
+  double shortestAngularDistance(double from, double to)
+  {
+    return normalizeAngle(to - from);
+  }
+
   // ====== Map callback ======
 
   void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
@@ -193,18 +234,21 @@ private:
 
     current_pose_ = *msg;
 
-    // Check if goal is reached
+    // Check if goal is reached (위치는 여기서만 체크)
     if (has_goal_) {
       double goal_dx = current_pose_.pose.position.x - goal_pose_.pose.position.x;
       double goal_dy = current_pose_.pose.position.y - goal_pose_.pose.position.y;
       double goal_distance = std::sqrt(goal_dx * goal_dx + goal_dy * goal_dy);
 
-      if (goal_distance < 0.5) {  // Goal reached threshold
+      if (goal_distance < 0.5) {  // Goal reached threshold (위치 기준)
         if (!goal_reached_) {
-          RCLCPP_INFO(this->get_logger(), "✓ Goal reached!");
+          RCLCPP_INFO(this->get_logger(), "✓ Goal position reached (within 0.5 m)");
           goal_reached_ = true;
+          publishGoalReached(true);
+          publishEmptyPath();  // clear remaining path so tracker does not keep moving
         }
-        return;  // Don't replan if goal is reached
+        // 위치 도착 후에는 새로 replan 하지 않음
+        return;
       }
     }
 
@@ -227,11 +271,17 @@ private:
     goal_pose_ = *msg;
     has_goal_ = true;
     goal_reached_ = false;  // Reset goal reached flag for new goal
+    publishGoalReached(false);
+
+    // goal yaw 업데이트
+    goal_yaw_ = quaternionToYaw(goal_pose_.pose.orientation);
+    const double rad2deg = 180.0 / 3.14159265358979323846;
 
     RCLCPP_INFO(this->get_logger(),
-      "New goal received: (%.2f, %.2f)",
+      "New goal received: (%.2f, %.2f), yaw=%.2f deg",
       goal_pose_.pose.position.x,
-      goal_pose_.pose.position.y);
+      goal_pose_.pose.position.y,
+      goal_yaw_ * rad2deg);
 
     // Publish goal marker for visualization
     publishGoalMarker();
@@ -284,22 +334,86 @@ private:
       smooth_world_path = world_path;
     }
 
+    // =====================================================
+    //  1) smooth_world_path로 목표 지점까지 이동
+    //  2) 목표 지점 (gx,gy)에서 제자리 회전 경로를 추가 (x,y 동일, yaw만 변화)
+    // =====================================================
+
+    std::vector<std::pair<double,double>> final_path;  // 위치
+    std::vector<double> yaw_list;                      // 각 위치에서의 yaw
+
+    if (!smooth_world_path.empty()) {
+      const std::size_t N_move = smooth_world_path.size();
+      final_path.reserve(N_move + 20);
+      yaw_list.reserve(N_move + 20);
+
+      // 이동 파트 마지막 구간의 방향 (goal에 들어갈 때의 heading)
+      double yaw_move_end = 0.0;
+      if (N_move >= 2) {
+        const auto &p_prev = smooth_world_path[N_move - 2];
+        const auto &p_last = smooth_world_path[N_move - 1];
+        yaw_move_end = std::atan2(
+          p_last.second - p_prev.second,
+          p_last.first  - p_prev.first);
+      } else {
+        // 경로가 한 점 뿐이면 현재 로봇 yaw 사용
+        yaw_move_end = quaternionToYaw(current_pose_.pose.orientation);
+      }
+
+      // 1) 이동 파트: smooth_world_path 그대로 사용, yaw는 접선 방향
+      for (std::size_t i = 0; i < N_move; ++i) {
+        final_path.push_back(smooth_world_path[i]);
+
+        double yaw_i = yaw_move_end;
+        if (i + 1 < N_move) {
+          const auto &p     = smooth_world_path[i];
+          const auto &p_next= smooth_world_path[i+1];
+          yaw_i = std::atan2(
+            p_next.second - p.second,
+            p_next.first  - p.first);
+        }
+        yaw_list.push_back(yaw_i);
+      }
+
+      // 2) 제자리 회전 파트
+      const int N_rot = 20;  // 회전을 몇 단계로 나눌지 (원하면 튜닝 가능)
+      double gx = goal_pose_.pose.position.x;
+      double gy = goal_pose_.pose.position.y;
+
+      // yaw_move_end → goal_yaw_ 로 가는 최단 회전 방향
+      double diff = shortestAngularDistance(yaw_move_end, goal_yaw_);
+
+      for (int k = 1; k <= N_rot; ++k) {
+        double alpha = static_cast<double>(k) / static_cast<double>(N_rot);
+        double yaw_k = normalizeAngle(yaw_move_end + alpha * diff);
+
+        // 위치는 모두 goal 지점 (제자리 회전)
+        final_path.emplace_back(gx, gy);
+        yaw_list.push_back(yaw_k);
+      }
+    }
+
+    if (final_path.empty()) {
+      RCLCPP_WARN(this->get_logger(), "Final path is empty after processing.");
+      return;
+    }
+
     // Convert to ROS Path message
     nav_msgs::msg::Path path_msg;
     path_msg.header.stamp = this->now();
     path_msg.header.frame_id = "map";
 
-    // First waypoint: 현재 로봇 pose
+    // First waypoint: 현재 로봇 pose (현재 orientation 그대로)
     geometry_msgs::msg::PoseStamped first_pose;
     first_pose.header = path_msg.header;
     first_pose.pose = current_pose_.pose;
     path_msg.poses.push_back(first_pose);
 
-    // 나머지 경로 점들을 Pose로 추가
+    // 나머지 경로 점들을 Pose로 추가 (position + orientation)
     geometry_msgs::msg::PoseStamped pose;
-    for (size_t i = 0; i < smooth_world_path.size(); ++i) {
-      double wx = smooth_world_path[i].first;
-      double wy = smooth_world_path[i].second;
+    for (std::size_t i = 0; i < final_path.size(); ++i) {
+      double wx = final_path[i].first;
+      double wy = final_path[i].second;
 
       // 첫 점이 현재 위치와 너무 가까우면 생략
       double dx = wx - current_pose_.pose.position.x;
@@ -313,23 +427,26 @@ private:
       pose.pose.position.x = wx;
       pose.pose.position.y = wy;
       pose.pose.position.z = 0.0;
-      pose.pose.orientation.w = 1.0;
+
+      double yaw = (i < yaw_list.size()) ? yaw_list[i] : goal_yaw_;
+      pose.pose.orientation = yawToQuaternion(yaw);
 
       path_msg.poses.push_back(pose);
     }
 
     path_pub_->publish(path_msg);
 
-    // Publish visualization markers (smooth path 기준)
-    publishPathMarkers(smooth_world_path);
+    // 시각화는 최종 경로(final_path) 기준으로
+    publishPathMarkers(final_path);
 
     // Only log if path length changed significantly or first time
-    static size_t last_path_size = 0;
+    static std::size_t last_path_size = 0;
     if (last_path_size == 0 ||
-        std::abs((int)smooth_world_path.size() - (int)last_path_size) > 3) {
-      RCLCPP_INFO(this->get_logger(), "Path updated: %zu waypoints (smoothed)",
-        smooth_world_path.size());
-      last_path_size = smooth_world_path.size();
+        std::abs(static_cast<int>(final_path.size()) -
+                 static_cast<int>(last_path_size)) > 3) {
+      RCLCPP_INFO(this->get_logger(), "Path updated: %zu waypoints (including in-place rotation)",
+        final_path.size());
+      last_path_size = final_path.size();
     }
   }
 
@@ -341,7 +458,7 @@ private:
 
     double origin_x = map_msg_->info.origin.position.x;
     double origin_y = map_msg_->info.origin.position.y;
-    double resolution = map_msg_->info.resolution;
+    double resolution = effective_resolution_m_;
 
     cell.x = static_cast<int>((x - origin_x) / resolution);
     cell.y = static_cast<int>((y - origin_y) / resolution);
@@ -353,7 +470,7 @@ private:
   {
     double origin_x = map_msg_->info.origin.position.x;
     double origin_y = map_msg_->info.origin.position.y;
-    double resolution = map_msg_->info.resolution;
+    double resolution = effective_resolution_m_;
 
     double world_x = origin_x + (x + 0.5) * resolution;
     double world_y = origin_y + (y + 0.5) * resolution;
@@ -444,10 +561,38 @@ private:
         if (has_map_) {
           updateInflatedMap();
         }
+      } else if (param.get_name() == "planning_resolution") {
+        double value = param.as_double();
+        if (value <= 0.0) {
+          result.successful = false;
+          result.reason = "planning_resolution must be positive";
+          return result;
+        }
+        planning_resolution_m_ = value;
+        RCLCPP_INFO(this->get_logger(),
+          "Updated planning_resolution to %.3f m", planning_resolution_m_);
+        if (has_map_) {
+          updateInflatedMap();
+        }
       }
     }
 
     return result;
+  }
+
+  void publishGoalReached(bool reached)
+  {
+    std_msgs::msg::Bool msg;
+    msg.data = reached;
+    goal_reached_pub_->publish(msg);
+  }
+
+  void publishEmptyPath()
+  {
+    nav_msgs::msg::Path path_msg;
+    path_msg.header.stamp = this->now();
+    path_msg.header.frame_id = "map";
+    path_pub_->publish(path_msg);
   }
 
   void updateInflatedMap()
@@ -465,50 +610,78 @@ private:
       return;
     }
 
-    // margin [m] → grid 셀 수로 변환
-    int inflation_cells = static_cast<int>(
-      std::round(obstacle_margin_m_ / map_resolution));
+    // Downsample factor to speed up planning (coarser grid)
+    downsample_factor_ = std::max(
+      1, static_cast<int>(std::round(planning_resolution_m_ / map_resolution)));
+    effective_resolution_m_ = map_resolution * static_cast<double>(downsample_factor_);
 
-    // planning map: 0 = free, 1 = margin zone, 2 = real obstacle
-    map_grid_.assign(height, std::vector<int>(width, 0));
+    int coarse_width = static_cast<int>(std::ceil(
+      static_cast<double>(width) / static_cast<double>(downsample_factor_)));
+    int coarse_height = static_cast<int>(std::ceil(
+      static_cast<double>(height) / static_cast<double>(downsample_factor_)));
 
-    // 1단계: real obstacle → 2로 설정
-    for (int y = 0; y < height; ++y) {
-      for (int x = 0; x < width; ++x) {
-        if (raw_map_grid_[y][x] == 1) {
-          map_grid_[y][x] = 2;  // real obstacle
+    // planning map: 0 = free, 2 = real obstacle (after downsampling)
+    map_grid_.assign(coarse_height, std::vector<int>(coarse_width, 0));
+
+    // Step 1: block-wise OR to project fine grid onto coarse grid
+    for (int cy = 0; cy < coarse_height; ++cy) {
+      int y_start = cy * downsample_factor_;
+      int y_end = std::min(height, y_start + downsample_factor_);
+      for (int cx = 0; cx < coarse_width; ++cx) {
+        int x_start = cx * downsample_factor_;
+        int x_end = std::min(width, x_start + downsample_factor_);
+
+        bool has_obstacle = false;
+        for (int y = y_start; y < y_end && !has_obstacle; ++y) {
+          for (int x = x_start; x < x_end; ++x) {
+            if (raw_map_grid_[y][x] == 1) {
+              has_obstacle = true;
+              break;
+            }
+          }
+        }
+
+        if (has_obstacle) {
+          map_grid_[cy][cx] = 2;  // coarse obstacle
         }
       }
     }
 
-    // 2단계: margin zone 설정 (real obstacle 주변을 1로)
+    // Step 2: inflate obstacles according to obstacle_margin (in coarse grid units)
+    int inflation_cells = static_cast<int>(
+      std::round(obstacle_margin_m_ / effective_resolution_m_));
     if (inflation_cells > 0) {
-      for (int y = 0; y < height; ++y) {
-        for (int x = 0; x < width; ++x) {
-          if (raw_map_grid_[y][x] == 1) {
-            for (int dy = -inflation_cells; dy <= inflation_cells; ++dy) {
-              for (int dx = -inflation_cells; dx <= inflation_cells; ++dx) {
-                int ny = y + dy;
-                int nx = x + dx;
-                if (nx < 0 || nx >= width || ny < 0 || ny >= height) {
-                  continue;
-                }
-                // 아직 real obstacle(2)이 아닌 free(0)만 margin(1)으로 올리기
-                if (map_grid_[ny][nx] == 0) {
-                  map_grid_[ny][nx] = 1;
-                }
+      std::vector<std::vector<int>> inflated = map_grid_;
+      for (int y = 0; y < coarse_height; ++y) {
+        for (int x = 0; x < coarse_width; ++x) {
+          if (map_grid_[y][x] != 2) {
+            continue;
+          }
+          for (int dy = -inflation_cells; dy <= inflation_cells; ++dy) {
+            for (int dx = -inflation_cells; dx <= inflation_cells; ++dx) {
+              int nx = x + dx;
+              int ny = y + dy;
+              if (nx < 0 || nx >= coarse_width || ny < 0 || ny >= coarse_height) {
+                continue;
               }
+              inflated[ny][nx] = 2;
             }
           }
         }
       }
+      map_grid_.swap(inflated);
     }
 
+    // margin [m] → grid 셀 수로 변환
+    // A*에 맵 해상도[m/셀] 전달
+    astar_.setResolution(effective_resolution_m_);
+
+    // planning map 전달 (0: free, 1: margin, 2: real obstacle)
     astar_.setMap(map_grid_);
 
     RCLCPP_INFO(this->get_logger(),
-      "Updated planning map with obstacle_margin = %.3f m (~%d cells)",
-      obstacle_margin_m_, inflation_cells);
+      "Updated planning map. raw_res=%.3f m, planning_res=%.3f m, obstacle_margin=%.3f m (~%d coarse cells)",
+      map_resolution, effective_resolution_m_, obstacle_margin_m_, inflation_cells);
   }
 
   // ====== ROS objects ======
@@ -519,6 +692,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_marker_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr goal_reached_pub_;
 
   // State variables
   bool has_map_;
@@ -539,6 +713,14 @@ private:
   // Parameters
   double resolution_;        // kept for compatibility
   double obstacle_margin_m_; // safety margin [m] around obstacles (soft cost)
+  double planning_resolution_m_; // desired planning grid resolution [m]
+
+  // Goal yaw (rad)
+  double goal_yaw_;
+
+  // Downsample info
+  int downsample_factor_;
+  double effective_resolution_m_;
 
   // Dynamic parameter callback
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;
