@@ -222,7 +222,16 @@ void PathTracker::UpdateParams(const rclcpp::Parameter& param) {
         _enable_stamped_cmd_vel = param.as_bool();
     }
 }
+
+void PathTracker::_YawAlignCallback(const std_msgs::msg::Bool::SharedPtr msg) {
+    _yaw_align_active = msg->data;
+}
 void PathTracker::_PubAction(const Action& solved_action) {
+    // If yaw alignment node is active, skip publishing to avoid fighting /cmd_vel
+    if (_yaw_align_active) {
+        return;
+    }
+
     // cmd_vel은 항상 출력
     auto twist_msg = std::make_unique<geometry_msgs::msg::Twist>();
     twist_msg->linear.x = solved_action.vx;
@@ -231,6 +240,7 @@ void PathTracker::_PubAction(const Action& solved_action) {
     
     // cmd_vel_stamped는 플래그로 조절
     if (_enable_stamped_cmd_vel) {
+        if (_yaw_align_active) return;
         auto twist_stamped_msg = std::make_unique<geometry_msgs::msg::TwistStamped>();
         twist_stamped_msg->header.stamp = this->now();
         twist_stamped_msg->header.frame_id = _frame_id;
