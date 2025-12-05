@@ -76,8 +76,7 @@ class GlobalLocalizerNode(Node):
         self.pf = ParticleFilter(
             min_particles=self.get_parameter('min_particles').value,
             max_particles=self.get_parameter('max_particles').value,
-            initial_noise=[0.2, 0.2, 0.2],
-            velocity_noise_gain=10.0 # 튜닝!
+            initial_noise=[0.2, 0.2, 0.2]  # x, y, yaw noise
         )
         # 초기 파티클 생성
         self.pf.initialize(self.init_x, self.init_y, init_yaw)
