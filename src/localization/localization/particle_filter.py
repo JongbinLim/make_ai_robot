@@ -9,7 +9,44 @@ from numba import njit, prange
 # ==============================================================================
 
 @njit(fastmath=True, cache=True)
-def predict_kernel(particles, dx, dy, dyaw, alphas, min_noise):
+def find_max_distance_kernel(particles, center_x, center_y):
+    """
+    중심점으로부터 가장 멀리 떨어진 파티클의 거리를 계산 (Outlier 영향 받음)
+    이름이 이렇긴 한데 이상치 생각해서 0.8배 해서 반환할 거임
+    """
+    n = len(particles)
+    max_dist_sq = 0.0
+
+    for i in range(n):
+        dx = particles[i, 0] - center_x
+        dy = particles[i, 1] - center_y
+        dist_sq = dx * dx + dy * dy
+
+        if dist_sq > max_dist_sq:
+            max_dist_sq = dist_sq
+
+    return np.sqrt(max_dist_sq) * 0.8
+
+
+@njit(fastmath=True, cache=True)
+def initialize_in_circle_kernel(particles, center_x, center_y, center_yaw, radius, n_particles):
+    """
+    중심점 기준 반지름 내에 균등하게 파티클 배치 & 가중치 초기화
+    """
+    for i in range(n_particles):
+        # 원 내부 균등 분포 샘플링 (r * sqrt(random))
+        r = radius * np.sqrt(np.random.random())
+        theta = np.random.random() * 2.0 * np.pi
+
+        particles[i, 0] = center_x + r * np.cos(theta)
+        particles[i, 1] = center_y + r * np.sin(theta)
+
+        # 방향은 현재 추정 방향 주변으로 할지, 전방향으로 할지 선택
+        # 여기서는 전방향(-pi ~ pi) 랜덤으로 설정하여 방향성을 잃은 상황 가정
+        particles[i, 2] = np.random.uniform(-np.pi, np.pi)
+
+@njit(fastmath=True, cache=True)
+def predict_kernel(particles, dx, dy, dyaw, alphas, min_noise, velocity_gain):
     """
     Motion Model 커널
     Numpy 벡터 연산 대신 명시적 루프를 사용할 수도 있지만,
@@ -21,10 +58,13 @@ def predict_kernel(particles, dx, dy, dyaw, alphas, min_noise):
     dist_trans = np.sqrt(dx ** 2 + dy ** 2)
     dist_rot = np.abs(dyaw)
 
+    extra_noise = velocity_gain * (dist_trans ** 1.5) # 1.5 지수승 튜닝!
+    noise_scale = 1.0 + extra_noise
+
     # 노이즈 표준편차 계산
-    sigma_x = max(alphas[0] * dist_trans + alphas[1] * dist_rot, min_noise[0])
-    sigma_y = max(alphas[2] * dist_trans + alphas[3] * dist_rot, min_noise[1])
-    sigma_yaw = max(alphas[4] * dist_trans + alphas[5] * dist_rot, min_noise[2])
+    sigma_x = max(alphas[0] * dist_trans + alphas[1] * dist_rot, min_noise[0]) * noise_scale
+    sigma_y = max(alphas[2] * dist_trans + alphas[3] * dist_rot, min_noise[1]) * noise_scale
+    sigma_yaw = max(alphas[4] * dist_trans + alphas[5] * dist_rot, min_noise[2]) * noise_scale
 
     # 파티클 업데이트 루프
     # Numba는 루프 내부의 sin/cos 연산을 매우 효율적으로 병렬화/최적화합니다.
@@ -51,7 +91,7 @@ def predict_kernel(particles, dx, dy, dyaw, alphas, min_noise):
         particles[i, 2] = p_yaw + noisy_dyaw
 
 
-@njit(fastmath=True, cache=True)
+@njit(fastmath=True, cache=True, parallel=True)
 def update_likelihood_kernel(particles, ranges, ranges_cos, ranges_sin,
                              map_flat, dist_map_flat,
                              map_width, map_height, map_res, map_origin_x, map_origin_y,
@@ -117,7 +157,7 @@ def update_likelihood_kernel(particles, ranges, ranges_cos, ranges_sin,
             total_log_score += score
 
         # Log-Sum-Exp 트릭을 위해 여기서는 log score만 저장
-        weights_unnorm[i] = total_log_score
+        weights_unnorm[i] = total_log_score / n_rays
 
     # Log-Sum-Exp trick to avoid overflow/underflow
     max_log = -1e15  # 매우 작은 수
@@ -268,11 +308,16 @@ class ParticleFilter:
     def __init__(self,
                  min_particles=300,
                  max_particles=3000,
-                 initial_noise=[0.1, 0.1, 0.1]):
+                 initial_noise=[0.1, 0.1, 0.1],
+                 velocity_noise_gain=3.0):
 
         self.min_particles = min_particles
         self.max_particles = max_particles
         self.num_particles = max_particles
+
+        # 속도 비례 노이즈 게인 저장
+        # 값이 클수록 고속 주행 시 파티클이 더 넓게 퍼집니다.
+        self.velocity_noise_gain = float(velocity_noise_gain)
 
         # Numba 호환성을 위해 Contiguous Array 유지
         self.particles = np.zeros((self.max_particles, 3), dtype=np.float32)
@@ -282,8 +327,8 @@ class ParticleFilter:
 
         # Motion Parameters
         #self.motion_alphas = np.array([0.1, 0.1, 0.05, 0.1, 0.07, 0.1], dtype=np.float32)
-        self.motion_alphas = np.array([0.09, 0.09, 0.06, 0.09, 0.06, 0.09], dtype=np.float32)
-        self.min_motion_noise = np.array([0.05, 0.05, 0.05], dtype=np.float32)
+        self.motion_alphas = np.array([0.09, 0.09, 0.06, 0.09, 0.06, 0.09], dtype=np.float32) # 튜닝!
+        self.min_motion_noise = np.array([0.05, 0.05, 0.05], dtype=np.float32) # 튜닝!
 
         self.last_estimated_pose = None
 
@@ -375,7 +420,7 @@ class ParticleFilter:
         predict_kernel(
             active_particles,
             float(dx), float(dy), float(dyaw),
-            self.motion_alphas, self.min_motion_noise
+            self.motion_alphas, self.min_motion_noise, self.velocity_noise_gain
         )
 
         # 각도 정규화
@@ -386,6 +431,44 @@ class ParticleFilter:
         angles = np.arange(n_scans, dtype=np.float32)[::step] * angle_inc + angle_min
         self.full_cos_cache = np.cos(angles).astype(np.float32)
         self.full_sin_cache = np.sin(angles).astype(np.float32)
+
+    def relocalize_around_pose(self):
+        """
+        현재 추정 위치를 중심으로, 가장 먼 파티클까지의 거리를 반경으로 하는 원 안에
+        파티클을 재배치하고 가중치를 초기화함.
+        """
+        # 1. 현재 추정 위치 가져오기
+        if self.last_estimated_pose is None:
+            self.get_estimated_pose()
+
+        est_x, est_y, est_yaw = self.last_estimated_pose
+
+        # 2. 가장 먼 파티클 거리 계산 (Radius)
+        # 현재 활성화된 파티클만 고려
+        active_particles = self.particles[:self.num_particles]
+
+        max_dist = find_max_distance_kernel(active_particles, est_x, est_y)
+
+        # 안전장치: 반경이 너무 작거나 너무 크면 보정
+        min_radius = 0.5  # 최소 0.5m는 확보
+        max_radius = 5.0  # 최대 5m 이상은 너무 넓음 (맵 크기에 따라 조절) # 튜닝!
+
+        radius = max(min_radius, min(max_dist, max_radius))
+
+        print(f"[PF] Expanding distribution: Center({est_x:.2f}, {est_y:.2f}), Radius: {radius:.2f}m")
+
+        # 3. 파티클 재배치 (Numba Kernel)
+        self.num_particles = self.max_particles
+
+        initialize_in_circle_kernel(
+            self.particles,
+            est_x, est_y, est_yaw,
+            radius,
+            self.num_particles
+        )
+
+        # 4. 가중치 초기화 (1/N)
+        self.weights = np.ones(self.num_particles, dtype=np.float32) / self.num_particles
 
     def _recover_from_kidnapping(self):
         """납치 복구 로직 (기존 Python 로직 유지)"""
@@ -459,9 +542,14 @@ class ParticleFilter:
             self.penalty_idx, self.dist_threshold, -10.0
         )
 
-        # Kidnapped 체크
-        if sum_weights < 1e-15 or np.isnan(sum_weights):
-            self._recover_from_kidnapping()
+        avg_weight = sum_weights / self.num_particles
+
+        # Case 1: 센서 데이터와 매칭이 아예 안 됨 -> 진짜 납치 (Global Reset)
+        if avg_weight < 1e-10:
+            self._recover_from_kidnapping()  # 맵 전체 랜덤
+        # Case 2: 매칭은 되는데 신뢰도가 낮음 -> 추적 놓침
+        elif avg_weight < 0.003:
+            self.relocalize_around_pose()  # 주변으로 확산
         else:
             self.weights = weights_unnorm / sum_weights
 
