@@ -168,7 +168,7 @@ def get_correspondences_grid(src, dst, grid, min_xy, grid_shape, resolution, max
     min_x, min_y = min_xy[0], min_xy[1]
     inv_res = 1.0 / resolution
 
-    search_radius = 6  # 0.05m * 4 = 20cm 범위 탐색
+    search_radius = 4  # 0.05m * 4 = 20cm 범위 탐색
 
     for i in prange(n_src):
         px = src[i, 0]
@@ -247,7 +247,7 @@ def icp_2d_grid_numba(previous_pcd, current_pcd, grid, min_xy, grid_shape, max_i
 
     for _ in range(max_iterations):
         dists, indices = get_correspondences_grid(
-            src, dst, grid, min_xy, grid_shape, 0.025, dist_th_sq
+            src, dst, grid, min_xy, grid_shape, 0.05, dist_th_sq
         )
 
         valid_mask = indices != -1
@@ -295,21 +295,22 @@ def quaternion_from_euler(roll, pitch, yaw):
 
 class RobotUKF:
     def __init__(self, dt=0.05, Q_params=None, R_icp_params=None, R_imu_params=None):
-        points = MerweScaledSigmaPoints(n=5, alpha=0.01, beta=2., kappa=0) # 튜닝!
+        # [TUNING] kappa=0 for dim=5 is generally safe.
+        points = MerweScaledSigmaPoints(n=5, alpha=0.1, beta=2., kappa=0)
         self.ukf = UnscentedKalmanFilter(dim_x=5, dim_z=3, dt=dt, fx=self.fx, hx=self.hx, points=points)
 
         self.ukf.x = np.zeros(5)
         self.ukf.P = np.eye(5) * 0.1
 
         self.dt_default = dt
-        q_diag = Q_params if Q_params else [0.001, 0.001, 0.001, 0.01, 0.05] # 튜닝!
+        q_diag = Q_params if Q_params else [0.001, 0.001, 0.001, 0.01, 0.05]
         self.Q_base = np.diag(q_diag)
         self.ukf.Q = self.Q_base.copy()
 
-        r_icp_diag = R_icp_params if R_icp_params else [0.05, 0.05, 0.02] # 튜닝!
+        r_icp_diag = R_icp_params if R_icp_params else [0.05, 0.05, 0.02]
         self.R_icp_base = np.diag(r_icp_diag)
 
-        r_imu_diag = R_imu_params if R_imu_params else [0.02] # 튜닝!
+        r_imu_diag = R_imu_params if R_imu_params else [0.02]
         self.R_imu = np.diag(r_imu_diag)
 
         # Assign mean functions
@@ -348,8 +349,8 @@ class RobotUKF:
         cmd_v, cmd_omega = u[0], u[1]
 
         # Control input mixing
-        alpha_v = 0.2 # 튜닝!
-        alpha_w = 0.2 # 튜닝!
+        alpha_v = 0.1 # 튜닝!
+        alpha_w = 0.0 # 튜닝!
         next_v = v + alpha_v * (cmd_v - v)
         next_omega = omega + alpha_w * (cmd_omega - omega)
 
@@ -390,27 +391,21 @@ class RobotUKF:
         # Force Symmetry to prevent non-positive definite errors
         self.ukf.P = (self.ukf.P + self.ukf.P.T) / 2.0
         # Add small noise to diagonal to prevent non-positive definite
-        self.ukf.P += np.eye(5) * 1e-4
+        self.ukf.P += np.eye(5) * 1e-6
 
         if dt > 1e-6:
             scale_factor = dt / self.dt_default
-            # dt가 너무 작아도 Q가 0이 되지 않도록 최소 scale 제한 (0.1)
-            scale = max(scale_factor, 0.1)
             self.ukf.Q = self.Q_base * scale_factor
         else:
             self.ukf.Q = self.Q_base
-
-        # Q도 대칭성 보장
-        self.ukf.Q = (self.ukf.Q + self.ukf.Q.T) / 2.0
 
         try:
             # Pass 'u' explicitly as kwarg, which filterpy passes to fx(x, dt, **kwargs)
             self.ukf.predict(dt=dt, u=u)
         except Exception as e:
             print(f"[UKF Predict Error] {e} - Resetting P")
-            P_init = np.diag([0.5, 0.5, 0.1, 1.0, 1.0])
-            self.ukf.P = P_init.copy()
-            # 재시도 하지 않고 넘어감 (재시도하면 또 터질 수 있음)
+            self.ukf.P = np.eye(5) * 0.1
+            self.ukf.predict(dt=dt, u=u)
 
     def update_icp(self, z, eigenvalues, eigenvectors, motion_factor=1.0):
         # Stabilize before update
