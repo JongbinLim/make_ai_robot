@@ -1,93 +1,85 @@
 cmake_minimum_required(VERSION 3.8)
-project(path_tracker)
+project(astar_planner)
 
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
-  # Suppress warnings from legacy code structure
-  add_compile_options(
-    -Wno-reorder                       # Suppress member initialization order warnings
-    -Wno-sign-compare                  # Suppress signed/unsigned comparison warnings
-    -Wno-unused-parameter              # Suppress unused parameter warnings
-    -Wno-deprecated-copy               # Suppress deprecated copy constructor warnings
-  )
 endif()
 
+# Find dependencies
 find_package(ament_cmake REQUIRED)
-find_package(ament_cmake_python REQUIRED)
 find_package(rclcpp REQUIRED)
-find_package(rclpy REQUIRED)
-find_package(ament_index_cpp REQUIRED)
-find_package(Eigen3 REQUIRED)
 find_package(std_msgs REQUIRED)
-find_package(nav_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
-find_package(tf2 REQUIRED)
+find_package(rclpy REQUIRED)
 find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
+# Include directories
 include_directories(include)
-include_directories(${EIGEN3_INCLUDE_DIRS})
 
-
-
-add_executable(path_tracker_node
-  src/path_tracker.cpp
-  src/action.cpp
-  src/communication.cpp
-  src/cost.cpp
-  src/dummy_path.cpp
-  src/dynamics.cpp
-  src/misc.cpp
-  src/regression.cpp
-  src/state.cpp
-  src/transform.cpp
-  src/visualization.cpp
-)
-
-ament_target_dependencies(path_tracker_node
+# Path Planner Node (src/astar.cpp)
+add_executable(path_planner_node src/path_planner_node.cpp src/astar.cpp)
+ament_target_dependencies(path_planner_node
   rclcpp
-  ament_index_cpp
-  std_msgs
   nav_msgs
   geometry_msgs
   visualization_msgs
-  tf2
+  std_msgs
   tf2_ros
+  tf2_geometry_msgs
 )
 
-target_link_libraries(path_tracker_node
-  ${EIGEN3_LIBRARIES}
+# Simulator Node (src/simulator_node.cpp)
+add_executable(simulator_node src/simulator_node.cpp)
+ament_target_dependencies(simulator_node 
+  rclcpp 
+  std_msgs 
+  geometry_msgs 
+  nav_msgs
+  visualization_msgs
 )
 
+# Install targets
 install(TARGETS
-  path_tracker_node
+  path_planner_node
+  simulator_node
   DESTINATION lib/${PROJECT_NAME}
 )
 
+# Install launch files
 install(DIRECTORY
   launch
-  config
-  path_tracker
-  DESTINATION share/${PROJECT_NAME}
+  DESTINATION share/${PROJECT_NAME}/
 )
 
-ament_python_install_package(${PROJECT_NAME})
+# Install config files
+install(DIRECTORY
+  config
+  DESTINATION share/${PROJECT_NAME}/
+)
 
-install(
-  PROGRAMS
-    path_tracker/move_go1.py
-  DESTINATION lib/${PROJECT_NAME}       
+# Install map files
+install(DIRECTORY
+  maps
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+# Install rviz files
+install(DIRECTORY
+  rviz
+  DESTINATION share/${PROJECT_NAME}/
+)
+
+# Install Python helper nodes
+install(PROGRAMS
+  src/yaw_aligner.py
+  DESTINATION lib/${PROJECT_NAME}
 )
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
-  # the following line skips the linter which checks for copyrights
-  # comment the line when a copyright and license is added to all source files
-  set(ament_cmake_copyright_FOUND TRUE)
-  # the following line skips cpplint (only works in a git repo)
-  # comment the line when this package is in a git repo and when
-  # a copyright and license is added to all source files
-  set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
 
