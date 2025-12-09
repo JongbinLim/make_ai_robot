@@ -6,6 +6,7 @@
 #include <cmath>
 #include <functional>
 #include <utility>  // std::pair
+#include <algorithm>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rcl_interfaces/msg/set_parameters_result.hpp"
@@ -19,6 +20,11 @@
 #include "visualization_msgs/msg/marker.hpp"
 
 #include "astar_planner/astar.hpp"
+
+// TF2
+#include "tf2_ros/buffer.h"
+#include "tf2_ros/transform_listener.h"
+#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 using namespace std::chrono_literals;
 
@@ -95,6 +101,7 @@ public:
     planning_resolution_m_(0.25),  // default coarse resolution for faster planning
     goal_yaw_(0.0),
     downsample_factor_(1),
+    global_frame_("map"),          
     effective_resolution_m_(1.0)
   {
     // Declare parameters
@@ -115,6 +122,10 @@ public:
     has_goal_ = false;
     has_current_pose_ = false;
     goal_reached_ = false;
+
+    // TF buffer & listener
+    tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
+    tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
 
     // Subscribers
     auto map_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
@@ -176,6 +187,31 @@ private:
     return normalizeAngle(to - from);
   }
 
+  // ======================
+  // TF helper: 임의 frame → global_frame_ (기본: "map")
+  // ======================
+  bool transformToMap(
+      const geometry_msgs::msg::PoseStamped & in,
+      geometry_msgs::msg::PoseStamped & out)
+  {
+    // frame_id가 비어있거나 이미 global_frame_이면 그대로 사용
+    if (in.header.frame_id.empty() || in.header.frame_id == global_frame_) {
+      out = in;
+      out.header.frame_id = global_frame_;
+      return true;
+    }
+
+    try {
+      out = tf_buffer_->transform(in, global_frame_);
+      return true;
+    } catch (const tf2::TransformException & ex) {
+      RCLCPP_WARN(this->get_logger(),
+        "Failed to transform from '%s' to '%s': %s",
+        in.header.frame_id.c_str(), global_frame_.c_str(), ex.what());
+      return false;
+    }
+  }
+
   // ====== Map callback ======
 
   void mapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg)
@@ -206,25 +242,33 @@ private:
     // 현재 obstacle_margin 설정값을 이용해 planning용 맵 생성
     updateInflatedMap();
 
-    RCLCPP_INFO(this->get_logger(), "Map received: %dx%d", width, height);
+    RCLCPP_INFO(this->get_logger(), "Map received: %dx%d (frame_id=%s)",
+      width, height, msg->header.frame_id.c_str());
   }
 
   // ====== Current pose callback ======
 
   void currentPoseCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
   {
+    // 어떤 frame에서 오든 global_frame_ ("map") 기준으로 변환
+    geometry_msgs::msg::PoseStamped pose_map;
+    if (!transformToMap(*msg, pose_map)) {
+      return;  // 변환 실패 시 이번 콜백은 패스
+    }
+
     if (!has_current_pose_) {
       has_current_pose_ = true;
-      current_pose_ = *msg;
-      previous_pose_ = *msg;
-      RCLCPP_INFO(this->get_logger(), "Robot position initialized at (%.2f, %.2f)",
-        current_pose_.pose.position.x, current_pose_.pose.position.y);
+      current_pose_ = pose_map;
+      previous_pose_ = pose_map;
+      RCLCPP_INFO(this->get_logger(), "Robot position initialized at (%.2f, %.2f) in %s",
+        current_pose_.pose.position.x, current_pose_.pose.position.y,
+        global_frame_.c_str());
       return;
     }
 
     // Check if robot position actually changed
-    double dx = msg->pose.position.x - previous_pose_.pose.position.x;
-    double dy = msg->pose.position.y - previous_pose_.pose.position.y;
+    double dx = pose_map.pose.position.x - previous_pose_.pose.position.x;
+    double dy = pose_map.pose.position.y - previous_pose_.pose.position.y;
     double distance = std::sqrt(dx * dx + dy * dy);
 
     // Only replan if position changed significantly (moved to new grid cell)
@@ -232,7 +276,7 @@ private:
       return;
     }
 
-    current_pose_ = *msg;
+    current_pose_ = pose_map;
 
     // Check if goal is reached (위치는 여기서만 체크)
     if (has_goal_) {
@@ -240,7 +284,7 @@ private:
       double goal_dy = current_pose_.pose.position.y - goal_pose_.pose.position.y;
       double goal_distance = std::sqrt(goal_dx * goal_dx + goal_dy * goal_dy);
 
-      if (goal_distance < 0.5) {  // Goal reached threshold (위치 기준)
+      if (goal_distance < 0.2) {  // Goal reached threshold (위치 기준)
         if (!goal_reached_) {
           RCLCPP_INFO(this->get_logger(), "✓ Goal position reached (within 0.5 m)");
           goal_reached_ = true;
@@ -252,8 +296,9 @@ private:
       }
     }
 
-    RCLCPP_INFO(this->get_logger(), "Robot moved to (%.2f, %.2f)",
-      current_pose_.pose.position.x, current_pose_.pose.position.y);
+    RCLCPP_INFO(this->get_logger(), "Robot moved to (%.2f, %.2f) in %s",
+      current_pose_.pose.position.x, current_pose_.pose.position.y,
+      global_frame_.c_str());
 
     // Store current position as previous for next comparison
     previous_pose_ = current_pose_;
@@ -268,7 +313,13 @@ private:
 
   void goalCallback(const geometry_msgs::msg::PoseStamped::SharedPtr msg)
   {
-    goal_pose_ = *msg;
+    // goal도 어떤 frame에서 오든 global_frame_으로 변환
+    geometry_msgs::msg::PoseStamped goal_map;
+    if (!transformToMap(*msg, goal_map)) {
+      return;
+    }
+
+    goal_pose_ = goal_map;
     has_goal_ = true;
     goal_reached_ = false;  // Reset goal reached flag for new goal
     publishGoalReached(false);
@@ -278,9 +329,10 @@ private:
     const double rad2deg = 180.0 / 3.14159265358979323846;
 
     RCLCPP_INFO(this->get_logger(),
-      "New goal received: (%.2f, %.2f), yaw=%.2f deg",
+      "New goal received: (%.2f, %.2f) in %s, yaw=%.2f deg",
       goal_pose_.pose.position.x,
       goal_pose_.pose.position.y,
+      global_frame_.c_str(),
       goal_yaw_ * rad2deg);
 
     // Publish goal marker for visualization
@@ -300,7 +352,7 @@ private:
       return;
     }
 
-    // Convert world coordinates to grid coordinates
+    // Convert world coordinates (global_frame_) to grid coordinates
     astar_planner::GridCell start = worldToGrid(
       current_pose_.pose.position.x,
       current_pose_.pose.position.y);
@@ -401,7 +453,7 @@ private:
     // Convert to ROS Path message
     nav_msgs::msg::Path path_msg;
     path_msg.header.stamp = this->now();
-    path_msg.header.frame_id = "map";
+    path_msg.header.frame_id = global_frame_;  // 일관된 global frame
 
     // First waypoint: 현재 로봇 pose (현재 orientation 그대로)
     geometry_msgs::msg::PoseStamped first_pose;
@@ -450,7 +502,7 @@ private:
     }
   }
 
-  // ====== Coordinate transforms ======
+  // ====== Coordinate transforms (map grid ↔ world) ======
 
   astar_planner::GridCell worldToGrid(double x, double y)
   {
@@ -485,7 +537,7 @@ private:
     visualization_msgs::msg::MarkerArray marker_array;
 
     visualization_msgs::msg::Marker line_marker;
-    line_marker.header.frame_id = "map";
+    line_marker.header.frame_id = global_frame_;
     line_marker.header.stamp = this->now();
     line_marker.ns = "path";
     line_marker.id = 0;
@@ -512,7 +564,7 @@ private:
   void publishGoalMarker()
   {
     visualization_msgs::msg::Marker marker;
-    marker.header.frame_id = "map";
+    marker.header.frame_id = global_frame_;
     marker.header.stamp = this->now();
     marker.ns = "goal";
     marker.id = 0;
@@ -591,7 +643,7 @@ private:
   {
     nav_msgs::msg::Path path_msg;
     path_msg.header.stamp = this->now();
-    path_msg.header.frame_id = "map";
+    path_msg.header.frame_id = global_frame_;
     path_pub_->publish(path_msg);
   }
 
@@ -672,7 +724,6 @@ private:
       map_grid_.swap(inflated);
     }
 
-    // margin [m] → grid 셀 수로 변환
     // A*에 맵 해상도[m/셀] 전달
     astar_.setResolution(effective_resolution_m_);
 
@@ -694,6 +745,11 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_marker_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr goal_reached_pub_;
 
+  // TF
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  
+
   // State variables
   bool has_map_;
   bool has_goal_;
@@ -711,9 +767,9 @@ private:
   astar_planner::AStar astar_;
 
   // Parameters
-  double resolution_;        // kept for compatibility
-  double obstacle_margin_m_; // safety margin [m] around obstacles (soft cost)
-  double planning_resolution_m_; // desired planning grid resolution [m]
+  double resolution_;             // kept for compatibility
+  double obstacle_margin_m_;      // safety margin [m] around obstacles (soft cost)
+  double planning_resolution_m_;  // desired planning grid resolution [m]
 
   // Goal yaw (rad)
   double goal_yaw_;
@@ -721,6 +777,9 @@ private:
   // Downsample info
   int downsample_factor_;
   double effective_resolution_m_;
+
+  // Global frame (TF)
+  std::string global_frame_;  // 보통 "map"
 
   // Dynamic parameter callback
   rclcpp::node_interfaces::OnSetParametersCallbackHandle::SharedPtr param_callback_handle_;

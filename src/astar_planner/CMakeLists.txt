@@ -13,18 +13,22 @@ find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(rclpy REQUIRED)
+find_package(tf2_ros REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 
 # Include directories
 include_directories(include)
 
 # Path Planner Node (src/astar.cpp)
 add_executable(path_planner_node src/path_planner_node.cpp src/astar.cpp)
-ament_target_dependencies(path_planner_node 
-  rclcpp 
-  std_msgs 
-  geometry_msgs 
+ament_target_dependencies(path_planner_node
+  rclcpp
   nav_msgs
+  geometry_msgs
   visualization_msgs
+  std_msgs
+  tf2_ros
+  tf2_geometry_msgs
 )
 
 # Simulator Node (src/simulator_node.cpp)
