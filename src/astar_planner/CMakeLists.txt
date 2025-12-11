@@ -75,6 +75,13 @@ install(DIRECTORY
 # Install Python helper nodes
 install(PROGRAMS
   src/yaw_aligner.py
+  src/example_goal_publisher.py
+  src/circle_path_publisher.py
+  DESTINATION lib/${PROJECT_NAME}
+)
+
+install(FILES
+  src/goal_utils.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
