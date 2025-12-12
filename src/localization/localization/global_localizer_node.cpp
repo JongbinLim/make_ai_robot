@@ -21,7 +21,6 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
-// 사용자 정의 Particle Filter 헤더 (같은 디렉토리에 위치한다고 가정)
 #include "particle_filter.hpp"
 
 using namespace std::chrono_literals;
@@ -297,6 +296,9 @@ private:
 
     void publish_particles(const rclcpp::Time& stamp)
     {
+        // 구독자가 없으면 연산조차 하지 않음
+        if (particle_pub_->get_subscription_count() == 0) return;
+
         // 성능을 위해 파티클 다운샘플링 (Python 코드와 유사하게 1/10 정도)
         const auto& particles = pf_->get_particles();
         size_t step = std::max(size_t(1), particles.size() / 10);
