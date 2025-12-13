@@ -8,6 +8,7 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
+from launch.substitutions import PythonExpression
 
 
 def generate_launch_description():
@@ -52,6 +53,7 @@ def generate_launch_description():
     world_file_name = LaunchConfiguration('world_file_name')
     use_gt_pose = LaunchConfiguration('use_gt_pose')
     use_gpu = LaunchConfiguration('use_gpu')
+    headless = LaunchConfiguration('headless')
 
     # Set the pose configuration variables
     x = LaunchConfiguration('x')
@@ -86,6 +88,12 @@ def generate_launch_description():
         name='use_gpu',
         default_value='true',
         description='Flag to enable using GPU for rendering')
+        
+    # [추가됨] Headless 모드 실행 인자 선언
+    declare_headless_cmd = DeclareLaunchArgument(
+        name='headless',
+        default_value='False',
+        description='Run Gazebo in headless mode (no GUI) if true')
 
     # Pose arguments
     declare_x_cmd = DeclareLaunchArgument(
@@ -143,6 +151,14 @@ def generate_launch_description():
         name='GZ_SIM_RESOURCE_PATH',
         value=gz_resource_path
     )    
+    
+    # Launch Gazebo world
+    # headless가 'true' 혹은 'True'일 경우 '-s -r' 옵션을, 아니면 '-r' 옵션을 사용
+    # -s: server only (headless mode)
+    # -r: run simulation immediately
+    gz_args_string = PythonExpression([
+        '"-s -r " if "', headless, '" == "true" or "', headless, '" == "True" else "-r "'
+    ])
 
     # Launch Gazebo world
     # 'world_file' changes with launch argument 'world_file_name'
@@ -150,7 +166,9 @@ def generate_launch_description():
     start_gazebo_world_cmd = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pkg_ros_gz_sim, 'launch', 'gz_sim.launch.py')),
-        launch_arguments=[('gz_args', [' -r ', world_file])]
+        launch_arguments={
+            'gz_args': [gz_args_string, world_file]
+        }.items()
     )
 
     # Bridge ROS topics and Gazebo messages for establishing communication
@@ -227,6 +245,7 @@ def generate_launch_description():
     # Create the launch description and populate
     ld = LaunchDescription()
 
+    ld.add_action(declare_headless_cmd)
     # Declare the launch options
     ld.add_action(declare_robot_name_cmd)
     ld.add_action(declare_use_sim_time_cmd)

@@ -25,6 +25,7 @@ PathTracker::PathTracker(const std::string& pkg_loc) : Node("path_tracker")
     _clicked_goal_sub   = create_subscription<geometry_msgs::msg::PointStamped>(_clicked_goal_topic, 10, std::bind(&PathTracker::_ClickedGoalCallback, this, std::placeholders::_1));
     _emergency_sub      = create_subscription<std_msgs::msg::Bool>(_emergency_topic, 1, std::bind(&PathTracker::_EmergencyCallback, this, std::placeholders::_1));
     _cost_map_sub       = create_subscription<nav_msgs::msg::OccupancyGrid>(_cost_map_topic, 10, std::bind(&PathTracker::_CostMapCallback, this, std::placeholders::_1));
+    _yaw_align_sub      = create_subscription<std_msgs::msg::Bool>("/yaw_align_active", 10, std::bind(&PathTracker::_YawAlignCallback, this, std::placeholders::_1));
 
     _gear_pub           = create_publisher<std_msgs::msg::Bool>(_gear_topic, 1);
     _twist_pub          = create_publisher<geometry_msgs::msg::Twist>(_cmd_ctrl_topic, 1);
@@ -302,9 +303,10 @@ std::vector<PathStamp> PathTracker::_GetPathSegmentBasedOnTgtVel(const std::vect
                            
     while(idx < path.size()) {
         if (idx < path.size() - 1) {
+            double dist = std::sqrt(std::pow(path[idx+1].x - path[idx].x, 2.0) + 
+                              std::pow(path[idx+1].y - path[idx].y, 2.0));
+
             if (cum_tgt_vel_dist < cum_dist) {
-                double dist = std::sqrt(std::pow(path[idx+1].x - path[idx].x, 2.0) + 
-                                  std::pow(path[idx+1].y - path[idx].y, 2.0));
                 double residual = dist - cum_dist + cum_tgt_vel_dist;
                 
                 new_stamp.x = path[idx].x + residual/dist * (path[idx+1].x - path[idx].x);
