@@ -147,6 +147,8 @@ public:
     viz_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>("/path_markers", 10);
     goal_marker_pub_ = this->create_publisher<visualization_msgs::msg::Marker>("/goal_marker", 10);
     goal_reached_pub_ = this->create_publisher<std_msgs::msg::Bool>("/goal_reached", 10);
+    goal_state_timer_ = this->create_wall_timer(
+      1s, std::bind(&PathPlannerNode::publishGoalReachedState, this));
 
     RCLCPP_INFO(this->get_logger(), "Path Planner Node initialized");
     RCLCPP_INFO(this->get_logger(), "Use RViz2 '2D Goal Pose' tool to set a goal");
@@ -639,6 +641,11 @@ private:
     goal_reached_pub_->publish(msg);
   }
 
+  void publishGoalReachedState()
+  {
+    publishGoalReached(goal_reached_);
+  }
+
   void publishEmptyPath()
   {
     nav_msgs::msg::Path path_msg;
@@ -744,6 +751,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr viz_pub_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr goal_marker_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr goal_reached_pub_;
+  rclcpp::TimerBase::SharedPtr goal_state_timer_;
 
   // TF
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;

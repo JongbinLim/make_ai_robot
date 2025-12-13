@@ -33,7 +33,7 @@ class YawAligner(Node):
         super().__init__("yaw_aligner")
 
         # Parameters
-        self.declare_parameter("yaw_tolerance", 0.05)       # [rad] widened to finish sooner
+        self.declare_parameter("yaw_tolerance", 0.02)       # [rad] widened to finish sooner
         self.declare_parameter("kp_ang", 1.0)               # proportional gain
         self.declare_parameter("max_ang_vel", 0.6)          # [rad/s] slower to reduce overshoot
         self.declare_parameter("slow_zone", 0.4)            # [rad] within this, scale angular speed down
@@ -49,6 +49,8 @@ class YawAligner(Node):
         self.current_pose = None
         self.target_yaw = None
         self.active = False
+        self.align_finished = False
+        self.last_goal_reached = False
 
         # Subscribers
         self.create_subscription(PoseStamped, "/go1_pose", self.pose_cb, 10)
@@ -57,8 +59,9 @@ class YawAligner(Node):
 
         # Publishers
         self.cmd_pub = self.create_publisher(Twist, "/cmd_vel", 10)
-        # Use default QoS so path_tracker (default subscription) always receives updates
-        self.active_pub = self.create_publisher(Bool, "/yaw_align_active", 10)
+        # Latched QoS so late joiners see current active state
+        qos = QoSProfile(depth=1, reliability=ReliabilityPolicy.RELIABLE, durability=DurabilityPolicy.TRANSIENT_LOCAL)
+        self.active_pub = self.create_publisher(Bool, "/yaw_align_active", qos)
 
         # Timer for control loop
         period = 1.0 / self.rate_hz if self.rate_hz > 0 else 0.05
@@ -74,14 +77,19 @@ class YawAligner(Node):
     def goal_cb(self, msg):
         self.target_yaw = quaternion_to_yaw(msg.pose.orientation)
         self.get_logger().info(f"YawAligner: target yaw set to {self.target_yaw:.3f} rad")
+        # reset state for new goal
+        self.align_finished = False
+        self.last_goal_reached = False
 
     def goal_reached_cb(self, msg: Bool):
-        if msg.data and self.target_yaw is not None:
+        # Rising edge on goal_reached and not already aligned
+        if msg.data and not self.last_goal_reached and self.target_yaw is not None and not self.align_finished:
             # Stop once at goal before starting yaw alignment
             self.send_cmd(0.0)
             self.active = True
             self.publish_active(True)
             self.get_logger().info("YawAligner: goal reached, starting yaw alignment.")
+        self.last_goal_reached = msg.data
 
     def publish_active(self, state: bool):
         msg = Bool()
@@ -99,6 +107,7 @@ class YawAligner(Node):
             # Stop robot before releasing control
             self.send_cmd(0.0)
             self.active = False
+            self.align_finished = True
             self.publish_active(False)
             self.get_logger().info("YawAligner: yaw aligned, releasing control.")
             return
