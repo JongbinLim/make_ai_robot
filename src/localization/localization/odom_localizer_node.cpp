@@ -202,7 +202,7 @@ struct KISSICPSolver {
     double adaptive_threshold_min;
 
     KISSICPSolver() : max_iterations(20), tolerance(1e-4),
-                      adaptive_threshold_initial(1.0), adaptive_threshold_min(0.2) {}
+                      adaptive_threshold_initial(1.0), adaptive_threshold_min(0.1) {}
 
     Eigen::Vector3d align(const std::vector<Eigen::Vector2d>& src,
                           const VoxelGridMap& map,
@@ -248,9 +248,15 @@ struct KISSICPSolver {
                                            map_normal.y() * ( c * src[i].x() - s * src[i].y());
                             Eigen::Vector3d J(map_normal.x(), map_normal.y(), j_ang);
 
-                            H_local += J * J.transpose();
-                            b_local += -residual * J;
-                            res_local += residual * residual;
+                            // Cauchy Weight Function
+                            double error_sq = residual * residual;
+                            double k = 0.5; // Scaling parameter
+                            double weight = 1.0 / (1.0 + error_sq / (k * k));
+
+                            // Jacobian과 b 계산 시 weight 곱하기
+                            H_local += weight * J * J.transpose();
+                            b_local += weight * -residual * J;
+                            res_local += error_sq;
                             valid_local++;
                         }
                     }
@@ -287,7 +293,7 @@ public:
         x_.setZero();
         P_.setIdentity(); P_ *= 0.1;
         Q_.setIdentity(); Q_.diagonal() << 0.001, 0.001, 0.001, 0.01, 0.05;
-        R_icp_.setIdentity(); R_icp_.diagonal() << 0.05, 0.05, 0.02;
+        R_icp_.setIdentity(); R_icp_.diagonal() << 0.03, 0.03, 0.02;
         R_imu_.setIdentity(); R_imu_ << 0.02;
 
         alpha_ = 0.1; beta_ = 2.0; kappa_ = 0.0;
@@ -458,7 +464,7 @@ public:
 
         tf_broadcaster_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
 
-        local_map_.voxel_size = 0.3;
+        local_map_.voxel_size = 0.15;
 
         last_cmd_time_ = this->now().seconds();
 
