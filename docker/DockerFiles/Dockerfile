@@ -9,6 +9,11 @@ ENV GZ_VERSION=harmonic
 ## arg ros2 distro 
 ARG DISTRO=jazzy
 # RUN is used to execute and add new layer on top of the base immage
+
+RUN sed -i 's|http://archive.ubuntu.com/ubuntu|http://mirror.kakao.com/ubuntu|g' /etc/apt/sources.list
+RUN sed -i 's|http://security.ubuntu.com/ubuntu|http://mirror.kakao.com/ubuntu|g' /etc/apt/sources.list
+
+
 RUN apt-get update 
 
 
@@ -35,7 +40,7 @@ RUN apt-get install -y \
     libeigen3-dev \
     nano \
     ros-${DISTRO}-rviz2 \
-    nautilus \ 
+    # nautilus \
     iputils-ping \
     iproute2  \
     python3-rosdep \
@@ -98,7 +103,12 @@ RUN pipx install numpy
 # Set up auto-source of workspace for ros user
 ARG WORKSPACE=docker_navigation
 WORKDIR /home/ros/${WORKSPACE}
-RUN sudo usermod -a -G render,avahi,video ${USERNAME}
+
+
+RUN sudo groupadd -f render && \
+    sudo groupadd -f avahi && \
+    sudo usermod -a -G render,avahi,video ${USERNAME}
+# RUN sudo usermod -a -G render,avahi,video ${USERNAME}
 RUN echo "source /opt/ros/${DISTRO}/setup.bash" >> ~/.bashrc
 
 RUN echo "if [ -f ~/${WORKSPACE}/install/setup.bash ]; then source ~/${WORKSPACE}/install/setup.bash; fi" >> /home/ros/.bashrc

@@ -68,6 +68,7 @@ class PathTracker : public rclcpp::Node {
         rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr _clicked_goal_sub;
         rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _emergency_sub;
         rclcpp::Subscription<nav_msgs::msg::OccupancyGrid>::SharedPtr _cost_map_sub;
+        rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr _yaw_align_sub;
 
         // Timer for main loop
         rclcpp::TimerBase::SharedPtr _timer;
@@ -93,6 +94,7 @@ class PathTracker : public rclcpp::Node {
         bool _vis_subgoal;
         bool _debug_cost;
         bool _enable_stamped_cmd_vel;
+        bool _yaw_align_active{false};
         int _num_vis;
 
         int _average;
@@ -150,6 +152,7 @@ class PathTracker : public rclcpp::Node {
         void _ClickedGoalCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
         void _EmergencyCallback(const std_msgs::msg::Bool::SharedPtr msg);
         void _CostMapCallback(const nav_msgs::msg::OccupancyGrid::SharedPtr msg);
+        void _YawAlignCallback(const std_msgs::msg::Bool::SharedPtr msg);
         
 
         // Helper methods
