@@ -22,7 +22,7 @@ class PerceptionNode(Node):
         ### ----------------------------
         # Load YOLO model
         ### ----------------------------
-        self.model = YOLO("best.pt")  # 가벼운 모델 예시
+        self.model = YOLO("best.pt")
 
         ### ----------------------------
         # Subscribers
@@ -82,44 +82,58 @@ class PerceptionNode(Node):
             return
 
         img = self.rgb_image.copy()
-        results = self.model(img, verbose=False)[0]  # YOLO inference
+        H, W = img.shape[:2]
+
+        # ===== 가로 중앙 60% 영역(0.2W ~ 0.8W) ===== 더 좁게 설정 가능 -> 0.3 ~ 0.7 등
+        left_line = int(W * 0.2)
+        right_line = int(W * 0.8)
+
+        # (선택) 디버깅용: 중앙 영역 기준선 그리기
+        cv2.line(img, (left_line, 0), (left_line, H), (0, 255, 255), 2)
+        cv2.line(img, (right_line, 0), (right_line, H), (0, 255, 255), 2)
+
+        # YOLO inference
+        results = self.model(img, verbose=False)[0]
 
         labels = []
         distance_to_target = -1.0
+        target_label = None
         bark_msg = "None"
+
+        # depth 이미지 크기
+        dh, dw = self.depth_image.shape[:2]
+
         for xyxy, cls in zip(results.boxes.xyxy, results.boxes.cls):
             x1, y1, x2, y2 = map(int, xyxy.tolist())
-            label = results.names[int(cls)]
-            labels.append(label)
-
-            print("img.shape =", img.shape)
-            print("results.orig_shape =", results.orig_shape)
-            print("results.boxes.xyxy =", results.boxes.xyxy)
-            print("x1, y1, x2, y2 =", x1, y1, x2, y2)
 
             # 중심점 계산
             cx = (x1 + x2) // 2
             cy = (y1 + y2) // 2
 
-            # depth 범위 체크 (필수)
-            h, w = self.depth_image.shape[:2]
-            if 0 <= cx < w and 0 <= cy < h:
+            # ===== 핵심: 가로 중앙 60% 안에 들어온 것만 "인식" =====
+            if not (left_line <= cx <= right_line):
+                continue
+
+            label = results.names[int(cls)]
+            labels.append(label)
+
+            # depth 범위 체크
+            if 0 <= cx < dw and 0 <= cy < dh:
                 depth = float(self.depth_image[cy, cx])
             else:
                 depth = -1.0
 
-            # 최소 distance 갱신
-            if distance_to_target < 0 or (depth > 0 and depth < distance_to_target):
+            # 최소 distance 갱신 (유효 depth만)
+            if depth > 0 and (distance_to_target < 0 or depth < distance_to_target):
                 distance_to_target = depth
                 target_label = label
 
             # bounding box 그리기
             cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 3)
-            # cv2.rectangle(img, (100, 100), (300, 300), (0, 0, 255), -1)
-
-            cv2.putText(img, label, (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
+            cv2.putText(
+                img, label, (x1, y1 - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2
+            )
 
         # ---------------------------
         # Publish detection image
@@ -144,10 +158,9 @@ class PerceptionNode(Node):
         # ---------------------------
         # Publish bark / None
         # ---------------------------
-        if labels:
-            # edible object이고 화면 중앙에 가까우면 bark 조건
-            if target_label in self.edible_objects:
-                bark_msg = "bark"
+        # 중앙 60% 안에서 잡힌 "가장 가까운" 물체가 edible이면 bark
+        if target_label is not None and target_label in self.edible_objects:
+            bark_msg = "bark"
 
         bark = String()
         bark.data = bark_msg
