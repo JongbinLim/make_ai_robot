@@ -1,0 +1,81 @@
+services:
+  craip:
+    image: ${IMAGE_NAME:-craip25_image}:${IMAGE_TAG:-0.1}
+    build:
+      context: ./docker/DockerFiles
+      dockerfile: Dockerfile
+      args:
+        - BASE_IMAGE=osrf/ros
+        - BASE_TAG=jazzy-desktop-full
+        - DISTRO=jazzy
+        - WORKSPACE=craip_ws
+
+    container_name: craip25
+    networks:
+      - ros2_internal
+    # network_mode: "host"
+    # Interactive shell settings
+    stdin_open: true
+    tty: true
+    # Network settings
+
+    # Environment variables
+    environment:
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - XAUTHORITY=/tmp/.docker.xauth
+      - ROS_DOMAIN_ID=0
+      - RMW_IMPLEMENTATION=rmw_cyclonedds_cpp
+      # Shell history
+      - HISTFILE=/home/ros/.bash_history
+      - HISTFILESIZE=10000
+      - RCUTILS_COLORIZED_OUTPUT=1
+      - GZ_VERSION=harmonic
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=graphics,display,video,utility,compute
+      - __NV_PRIME_RENDER_OFFLOAD=1
+      - __GLX_VENDOR_LIBRARY_NAME=nvidia
+      
+    privileged: true  # Fixed spelling and removed duplicate
+    volumes:
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+      # - /tmp/.docker.xauth:/tmp/.docker.xauth:rw
+      - ~/.bash_history:/home/ros/.bash_history
+      # Mount the entire make_ai_robot workspace as craip_ws
+      - ..:/home/ros/craip_ws
+      - /dev/input:/dev/input
+      - /dev/dri:/dev/dri
+      - /dev/nvidia0:/dev/nvidia0
+      - /dev/nvidiactl:/dev/nvidiactl
+      - /dev/nvidia-modeset:/dev/nvidia-modeset
+      
+
+    # Command to source ROS2 environment and start shell
+    command: >
+      bash -c "
+        source /opt/ros/jazzy/setup.bash &&
+        if [ -f /home/ros/craip_ws/install/setup.bash ]; then 
+          source /home/ros/craip_ws/install/setup.bash
+        fi &&
+        echo 'ROS2 Jazzy environment loaded' &&
+        echo 'Workspace: /home/ros/craip_ws' &&
+        bash
+      "
+    # devices:
+    #   - /dev/dri:/dev/dri
+    #   - /dev/nvidia0:/dev/nvidia0
+    #   - /dev/nvidiactl:/dev/nvidiactl
+    #   - /dev/nvidia-modeset:/dev/nvidia-modeset
+    runtime: nvidia
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+networks:
+  ros2_internal:
+    driver: bridge
+    

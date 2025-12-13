@@ -12,7 +12,7 @@ def generate_launch_description() -> LaunchDescription:
                 output="screen",
                 parameters=[
                     {
-                        "image_topic": "/camera_top/image",
+                        "image_topic": "/camera/detections/image",
                         "object_topic": "/detections/labels",
                         "distance_topic": "/detections/distance",
                         "speech_topic": "/robot_dog/speech",
