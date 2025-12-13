@@ -6,7 +6,15 @@ prompt: |
   Your task is to select the appropriate action among the candidates.
 
   Here is the list of candidates:
-  ACTION_CANDIDATES
+  - stop.py: stop all robot motion and freeze
+  - go_front.py: move the robot forward
+  - go_to_toilet.py: navigate the robot to the toilet location
+  - push_the_box.py: move in front of the box and push the box
+  - find_blue_cone.py: find blue cone
+  - find_green_cone.py: find green cone
+  - find_red_cone.py: find red cone
+  - go_back.launch.py: move the robot backward
+
 
   And here is the user command:
   USER_COMMAND
@@ -20,5 +28,10 @@ action_candidates:
   node:
     - stop.py
     - go_front.py
+    - go_to_toilet.py
+    - push_the_box.py
+    - find_blue_cone.py
+    - find_green_cone.py
+    - find_red_cone.py
   launch:
     - go_back.launch.py

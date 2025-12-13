@@ -28,6 +28,11 @@ install(
     language_command_handler/go_front.py
     language_command_handler/go_back.py
     language_command_handler/stop.py
+    language_command_handler/go_to_toilet.py
+    language_command_handler/find_red_cone.py
+    language_command_handler/find_green_cone.py
+    language_command_handler/find_blue_cone.py
+    language_command_handler/push_the_box.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
