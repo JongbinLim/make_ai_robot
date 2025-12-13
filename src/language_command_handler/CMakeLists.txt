@@ -28,6 +28,7 @@ install(
     language_command_handler/go_front.py
     language_command_handler/go_back.py
     language_command_handler/stop.py
+    language_command_handler/go_to_toilet.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
