@@ -22,7 +22,7 @@ class PerceptionNode(Node):
         ### ----------------------------
         # Load YOLO model
         ### ----------------------------
-        self.model = YOLO("yolov8s.pt")  # 가벼운 모델 예시
+        self.model = YOLO("best.pt")  # 가벼운 모델 예시
 
         ### ----------------------------
         # Subscribers
