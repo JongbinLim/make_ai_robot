@@ -1,14 +1,29 @@
-# slam_toolbox_config.yaml
 slam_toolbox:
   ros__parameters:
+    # --- 기본 설정 ---
     use_sim_time: true
+    mode: mapping
     map_frame: map
     odom_frame: odom
-    base_frame: base          # you’re using 'base', not 'base_link'
+    base_frame: base
     scan_topic: /scan
-    mode: mapping             # online mapping
-    resolution: 0.05
-    max_laser_range: 30.0
-    minimum_travel_distance: 0.1
-    minimum_travel_heading: 0.1
+
+    # --- 1. 해상도 및 센서 (정밀도 향상) ---
+    resolution: 0.025            # 2.5cm 해상도
+    max_laser_range: 15.0        # 너무 먼 거리는 신뢰하지 않음 (노이즈 방지)
+
+    # --- 2. 이동 업데이트 (노이즈 누적 방지) ---
+    minimum_travel_distance: 0.3 # 30cm 이동 시마다 맵 업데이트
+    minimum_travel_heading: 0.3  # 약 17도 회전 시마다 맵 업데이트
+    
+    # --- 3. 스캔 매칭 (벽 겹침 방지) ---
+    correlation_search_space_dimension: 0.5
+    correlation_search_space_resolution: 0.01
+    
+    # --- 4. 맵 관리 (확률) ---
+    # 점유 확률(Occupancy)을 더 엄격하게 관리하여 벽을 선명하게 함
+    prob_hit: 0.7                # 장애물일 확률 증가 폭 (기본 0.5보다 높게)
+    prob_miss: 0.4               # 빈 공간일 확률 감소 폭
+
+    # --- 기타 ---
     transform_publish_period: 0.02
