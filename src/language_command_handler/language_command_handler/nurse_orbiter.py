@@ -1,125 +1,266 @@
 #!/usr/bin/env python3
-"""
-Node: nurse_orbiter
-Description:
-1. 지정된 Break Room 좌표로 이동합니다.
-2. Perception 노드를 통해 간호사(person)를 찾습니다.
-3. 간호사를 중심으로 원형으로 회전(Orbit)합니다.
-"""
-
 import math
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
-from geometry_msgs.msg import PoseStamped
-from std_msgs.msg import String, Float32
 
-# 미션 상수 설정
-TARGET_ROOM_POSE = (-6.25, -25.0, 3.13) # (x, y, yaw)
-TARGET_LABEL = "person"                 # YOLO에서 감지되는 라벨명 (간호사)
-ORBIT_RADIUS_OFFSET = 0.0               # 인식된 거리보다 더 멀리 돌고 싶으면 값을 추가 (미터)
-ORBIT_POINTS = 12                       # 원을 몇 개의 점으로 나눌지 (많을수록 부드러움)
-WAYPOINT_TOLERANCE = 0.5                # 각 웨이포인트 도착 판정 거리
+from geometry_msgs.msg import PoseStamped, PointStamped
+from sensor_msgs.msg import CameraInfo
+from std_msgs.msg import String
+
+# -------------------------------
+# Mission constants
+# -------------------------------
+TARGET_ROOM_POSE = (-7.5, -25.0, 3.13) 
+TARGET_LABEL = "nurse"
+
+CONTROL_PERIOD = 0.2  # 제어 루프는 빠르더라도
+GOAL_RESEND_PERIOD = 3.0  # [추가] 목표 재전송 주기는 느리게 (혹시 씹혔을 때 대비)
+
+WAYPOINT_TOLERANCE = 0.35 # [수정] 조금 더 관대하게 (도착 판정 잘 되도록)
+
+# SEARCH
+SEARCH_YAW_STEP = math.radians(30)
+SEARCH_YAW_TOL  = math.radians(5)
+SEARCH_SETTLE_TICKS = 2
+PERCEPTION_FRESH_SEC = 2.0
+DETECT_CONFIRM_N = 1
+
+# CENTERING
+CENTER_TOL_PX = 40          
+MAX_YAW_STEP = math.radians(20)
+CENTERING_STABLE_TICKS = 3  
+CENTERING_FRESH_STRICT_SEC = 0.5
+
+# Camera fallback
+IMG_WIDTH_FALLBACK = 640.0
+IMG_CENTER_U_FALLBACK = IMG_WIDTH_FALLBACK * 0.5
+
+# ORBIT
+ORBIT_RADIUS = 1.0
+ORBIT_POINTS = 12           
+ORBIT_CCW = True       
+ORBIT_REPEAT = True     
+
 
 class NurseOrbiter(Node):
     def __init__(self):
-        super().__init__('nurse_orbiter')
+        super().__init__("nurse_orbiter")
 
-        # 상태 정의
-        self.state = "GO_TO_ROOM" # GO_TO_ROOM -> SEARCHING -> ORBITING -> FINISHED
-        self.current_pose = None
-        self.detected_labels = []
-        self.target_distance = -1.0
-        
-        # Orbit 관련 변수
-        self.nurse_pose = None # (x, y)
-        self.orbit_waypoints = []
+        self.state = "GO_TO_ROOM"
+        self._state_entered = True
+
+        # pose
+        self.current_pose: PoseStamped | None = None
+
+        # perception
+        self.detected_labels: list[str] = []
+        self.last_labels_time = None
+        self.nurse_u = -1.0
+        self.nurse_depth = -1.0
+        self.last_nurse_center_time = None
+        self.camera_info: CameraInfo | None = None
+
+        # searching
+        self.search_yaw = 0.0
+        self.search_steps_done = 0
+        self.max_search_steps = int(2 * math.pi / SEARCH_YAW_STEP)
+        self.search_phase = "ROTATE"
+        self.search_settle_counter = 0
+        self.detect_confirm_count = 0
+
+        # centering
+        self.center_stable_cnt = 0
+
+        # frozen nurse map
+        self.nurse_map_x: float | None = None
+        self.nurse_map_y: float | None = None
+
+        # orbit
+        self.orbit_waypoints: list[tuple[float, float, float]] = []
         self.current_waypoint_idx = 0
-        self.orbit_radius = 1.5 # 기본값 (탐색 실패 시 안전거리)
 
-        # QoS 설정
-        qos_profile = QoSProfile(depth=10)
+        # [NEW] 목표 발행 관리용 변수
+        self.last_published_target = None # (x, y, yaw)
+        self.last_goal_pub_time = None
 
-        # Subscribers
-        self.pose_sub = self.create_subscription(
-            PoseStamped, 
-            "/go1_pose", 
-            self.pose_callback, 
-            qos_profile
-        )
-        
-        self.label_sub = self.create_subscription(
-            String, 
-            "/detections/labels", 
-            self.label_callback, 
-            qos_profile
-        )
-        
-        # Perception Node에서 거리를 받아옴 (topic 이름은 perception_node 구현에 따라 다를 수 있으나 관례상 추정)
-        # perception_node.py의 self.pub_distance에 해당하는 토픽
-        self.dist_sub = self.create_subscription(
-            Float32,
-            "/detections/distance", 
-            self.distance_callback,
-            qos_profile
-        )
+        qos = QoSProfile(depth=10)
+        self.pose_sub = self.create_subscription(PoseStamped, "/go1_pose", self.pose_callback, qos)
+        self.label_sub = self.create_subscription(String, "/detections/labels", self.label_callback, qos)
+        self.nurse_center_sub = self.create_subscription(PointStamped, "/detections/nurse_center", self.nurse_center_callback, qos)
+        self.caminfo_sub = self.create_subscription(CameraInfo, "/camera_top/camera_info", self.camera_info_callback, qos)
 
-        # Publisher
         self.goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
+        self.timer = self.create_timer(CONTROL_PERIOD, self.control_loop)
 
-        # Main Control Loop (0.5초 주기)
-        self.timer = self.create_timer(0.5, self.control_loop)
-        
-        self.get_logger().info("Nurse Orbiter Node Started. Destination: Break Room")
+        self.get_logger().info("NurseOrbiter Started (Smart Goal Publishing).")
 
-    def pose_callback(self, msg):
+    # ---------------- callbacks ----------------
+    def pose_callback(self, msg: PoseStamped):
         self.current_pose = msg
 
-    def label_callback(self, msg):
-        # "person, chair, table" 형태의 문자열을 리스트로 파싱
-        self.detected_labels = [label.strip() for label in msg.data.split(',')]
+    def label_callback(self, msg: String):
+        self.detected_labels = [l.strip() for l in msg.data.split(",") if l.strip()]
+        self.last_labels_time = self.get_clock().now()
 
-    def distance_callback(self, msg):
-        self.target_distance = msg.data
+    def nurse_center_callback(self, msg: PointStamped):
+        self.nurse_u = float(msg.point.x)
+        self.nurse_depth = float(msg.point.z)
+        self.last_nurse_center_time = self.get_clock().now()
 
-    def get_yaw_from_pose(self, pose):
-        # 쿼터니언을 Yaw(라디안)로 변환
-        q = pose.pose.orientation
-        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
-        return math.atan2(siny_cosp, cosy_cosp)
+    def camera_info_callback(self, msg: CameraInfo):
+        self.camera_info = msg
 
-    def publish_goal(self, x, y, yaw):
+    # ---------------- utils ----------------
+    def check_goal_needs_publish(self, x, y, yaw):
+        """
+        목표가 바뀌었거나, 마지막 전송 후 일정 시간이 지났으면 True 반환
+        """
+        now = self.get_clock().now()
+        
+        # 1. 목표가 바뀜?
+        is_different = False
+        if self.last_published_target is None:
+            is_different = True
+        else:
+            lx, ly, lyaw = self.last_published_target
+            # 유클리드 거리나 각도 차이가 있으면 다름
+            diff = math.hypot(lx - x, ly - y) + abs(lyaw - yaw)
+            if diff > 0.05: # 5cm or 0.05rad 차이
+                is_different = True
+
+        # 2. 시간이 오래 지남? (Keep-alive)
+        is_timeout = False
+        if self.last_goal_pub_time is not None:
+            elapsed = (now - self.last_goal_pub_time).nanoseconds * 1e-9
+            if elapsed > GOAL_RESEND_PERIOD:
+                is_timeout = True
+        else:
+            is_timeout = True
+
+        return is_different or is_timeout
+
+    def publish_goal_smart(self, x: float, y: float, yaw: float):
+        """
+        조건부 발행: 너무 자주 보내지 않음
+        """
+        if self.check_goal_needs_publish(x, y, yaw):
+            self.publish_goal_force(x, y, yaw)
+            self.last_published_target = (x, y, yaw)
+            self.last_goal_pub_time = self.get_clock().now()
+
+    def publish_goal_force(self, x: float, y: float, yaw: float):
+        """무조건 발행 (내부용)"""
         goal = PoseStamped()
         goal.header.stamp = self.get_clock().now().to_msg()
         goal.header.frame_id = "map"
-        goal.pose.position.x = x
-        goal.pose.position.y = y
-        goal.pose.position.z = 0.0
-        
-        # Yaw to Quaternion (간략화)
+        goal.pose.position.x = float(x)
+        goal.pose.position.y = float(y)
+
         cy = math.cos(yaw * 0.5)
         sy = math.sin(yaw * 0.5)
         goal.pose.orientation.w = cy
         goal.pose.orientation.z = sy
-        goal.pose.orientation.x = 0.0
-        goal.pose.orientation.y = 0.0
-
         self.goal_pub.publish(goal)
+        # self.get_logger().info(f"Goal Pub: ({x:.2f}, {y:.2f})")
 
-    def generate_orbit_path(self, center_x, center_y, radius):
-        """간호사 위치(Center)를 중심으로 원형 웨이포인트 생성"""
-        waypoints = []
+    # ... (기타 유틸 함수들은 기존과 동일, pixel_to_bearing 등)
+    @staticmethod
+    def wrap_to_pi(a: float) -> float:
+        return math.atan2(math.sin(a), math.cos(a))
+
+    def time_since(self, t) -> float:
+        if t is None:
+            return float("inf")
+        return (self.get_clock().now() - t).nanoseconds * 1e-9
+
+    def labels_fresh(self) -> bool:
+        return self.time_since(self.last_labels_time) <= PERCEPTION_FRESH_SEC
+
+    def nurse_center_fresh(self) -> bool:
+        return self.time_since(self.last_nurse_center_time) <= PERCEPTION_FRESH_SEC and self.nurse_u >= 0.0
+
+    def get_yaw_from_pose(self, pose: PoseStamped) -> float:
+        q = pose.pose.orientation
+        siny_cosp = 2 * (q.w * q.z + q.x * q.y)
+        cosy_cosp = 1 - 2 * (q.y * q.y + q.z * q.z)
+        return math.atan2(siny_cosp, cosy_cosp)
+    
+    @staticmethod
+    def clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    def get_image_center_u(self) -> float:
+        if self.camera_info is not None and len(self.camera_info.k) >= 9:
+            return float(self.camera_info.k[2])
+        if self.camera_info is not None and self.camera_info.width > 0:
+            return float(self.camera_info.width) * 0.5
+        return IMG_CENTER_U_FALLBACK
+
+    def pixel_to_bearing(self, u_px: float) -> float:
+        if self.camera_info is not None and len(self.camera_info.k) >= 9:
+            fx = float(self.camera_info.k[0])
+            cx = float(self.camera_info.k[2])
+            if fx > 1e-6:
+                return math.atan2((cx - u_px), fx) 
+        w = IMG_WIDTH_FALLBACK
+        hfov = math.radians(80.0)
+        ratio = (u_px - (w * 0.5)) / (w * 0.5)
+        return -ratio * (hfov * 0.5) 
+
+    def reset_search(self, curr_yaw: float):
+        self.search_yaw = curr_yaw
+        self.search_steps_done = 0
+        self.search_phase = "ROTATE"
+        self.search_settle_counter = 0
+        self.detect_confirm_count = 0
+
+    def set_state(self, s: str):
+        if self.state != s:
+            self.state = s
+            self._state_entered = True
+            # 상태 바뀔 때 목표 발행 기록 초기화 (바로 발행되도록)
+            self.last_published_target = None 
+            if s != "CENTERING":
+                self.center_stable_cnt = 0
+
+    def freeze_nurse_map(self, curr_x: float, curr_y: float, curr_yaw: float) -> bool:
+        if not self.nurse_center_fresh():
+            return False
+        if self.nurse_depth is None or self.nurse_depth <= 0.1:
+            self.get_logger().warn(f"Freeze Fail: Invalid Depth ({self.nurse_depth})")
+            return False
+
+        bearing = self.pixel_to_bearing(self.nurse_u)
+        abs_yaw = curr_yaw + bearing 
+        nx = curr_x + self.nurse_depth * math.cos(abs_yaw)
+        ny = curr_y + self.nurse_depth * math.sin(abs_yaw)
+
+        self.nurse_map_x = nx
+        self.nurse_map_y = ny
+        self.get_logger().info(f"Freeze Success! Nurse at ({nx:.2f}, {ny:.2f})")
+        return True
+
+    def build_orbit_waypoints_with_entry(self, cx: float, cy: float, curr_x: float, curr_y: float) -> list[tuple[float, float, float]]:
+        r = ORBIT_RADIUS
+        direction = 1.0 if ORBIT_CCW else -1.0
+        delta = 2.0 * math.pi / ORBIT_POINTS
+
+        start_angle = math.atan2(curr_y - cy, curr_x - cx)
+        entry_x = cx + r * math.cos(start_angle)
+        entry_y = cy + r * math.sin(start_angle)
+        entry_yaw = self.wrap_to_pi(start_angle + direction * (math.pi / 2.0))
+        
+        wps = [(entry_x, entry_y, entry_yaw)]
         for i in range(ORBIT_POINTS):
-            angle = (2 * math.pi / ORBIT_POINTS) * i
-            # 현재 로봇 위치에서 시작하도록 위상을 조정할 수도 있으나, 여기선 0도부터 시작
-            wx = center_x + radius * math.cos(angle)
-            wy = center_y + radius * math.sin(angle)
-            w_yaw = angle + (math.pi / 2)
-            
-            waypoints.append((wx, wy, w_yaw))
-        return waypoints
+            theta = start_angle + direction * delta * (i + 1)
+            wx = cx + r * math.cos(theta)
+            wy = cy + r * math.sin(theta)
+            wyaw = self.wrap_to_pi(theta + direction * (math.pi / 2.0))
+            wps.append((wx, wy, wyaw))
+        return wps
 
+    # ---------------- main loop ----------------
     def control_loop(self):
         if self.current_pose is None:
             return
@@ -128,83 +269,156 @@ class NurseOrbiter(Node):
         curr_y = self.current_pose.pose.position.y
         curr_yaw = self.get_yaw_from_pose(self.current_pose)
 
-        # ---------------------------------------------------------
-        # 1. 방으로 이동 (Move to Room)
-        # ---------------------------------------------------------
+        # 1) GO_TO_ROOM
         if self.state == "GO_TO_ROOM":
+            if self._state_entered:
+                self.get_logger().info("State=GO_TO_ROOM")
+                self._state_entered = False
+                self.nurse_map_x = None
+                self.nurse_map_y = None
+                self.orbit_waypoints = []
+                self.current_waypoint_idx = 0
+
             tx, ty, tyaw = TARGET_ROOM_POSE
             dist = math.hypot(tx - curr_x, ty - curr_y)
-
-            if dist > 1.0: # 도착 임계값 (방 입구 근처면 충분)
-                self.publish_goal(tx, ty, tyaw)
-                self.get_logger().info_once("Moving to the Break Room...")
+            if dist > 1.0:
+                # [수정] Smart Publish 적용
+                self.publish_goal_smart(tx, ty, tyaw)
             else:
-                self.get_logger().info("Arrived at room. Start searching for nurse...")
-                self.state = "SEARCHING"
+                self.get_logger().info("Arrived -> SEARCHING")
+                self.reset_search(curr_yaw)
+                self.set_state("SEARCHING")
+            return
 
-        # ---------------------------------------------------------
-        # 2. 간호사 탐색 (Search)
-        # ---------------------------------------------------------
-        elif self.state == "SEARCHING":
-            # 간호사(person)가 감지되고, 유효한 거리정보가 들어오는지 확인
-            if TARGET_LABEL in self.detected_labels and self.target_distance > 0:
-                self.get_logger().info(f"Nurse detected! Distance: {self.target_distance:.2f}m")
-                
-                # 간호사의 절대 위치 추정 (현재 로봇 위치 + 거리 * 방향)
-                # Perception Node가 카메라 정면 기준 거리를 준다고 가정
-                nurse_x = curr_x + self.target_distance * math.cos(curr_yaw)
-                nurse_y = curr_y + self.target_distance * math.sin(curr_yaw)
-                self.nurse_pose = (nurse_x, nurse_y)
-                
-                # 회전 반경 설정 (발견된 거리 그대로 유지하거나 약간 조정)
-                self.orbit_radius = self.target_distance + ORBIT_RADIUS_OFFSET
-                
-                # 웨이포인트 생성
-                self.orbit_waypoints = self.generate_orbit_path(nurse_x, nurse_y, self.orbit_radius)
-                self.state = "ORBITING"
-                self.get_logger().info(f"Orbit path generated with {len(self.orbit_waypoints)} points.")
-            
-            else:
-                # 못 찾았으면 제자리 회전하며 탐색 (또는 방 좌표로 계속 이동)
-                self.get_logger().info_once("Searching for nurse...")
-                # 제자리 회전 명령 (현재 위치에서 yaw만 변경) - 여기선 단순화를 위해 기존 goal 유지
-                # 필요 시 제자리 회전 로직 추가 가능
+        # 2) SEARCHING
+        if self.state == "SEARCHING":
+            if self._state_entered:
+                self.get_logger().info("State=SEARCHING")
+                self._state_entered = False
 
-        # ---------------------------------------------------------
-        # 3. 회전 (Orbit)
-        # ---------------------------------------------------------
-        elif self.state == "ORBITING":
-            if self.current_waypoint_idx >= len(self.orbit_waypoints):
-                self.get_logger().info("Orbit Mission Completed!")
-                self.state = "FINISHED"
+            # [수정] Search 중에도 목표가 계속 같으면 굳이 spam 하지 않음
+            self.publish_goal_smart(curr_x, curr_y, self.search_yaw)
+            yaw_err = abs(self.wrap_to_pi(self.search_yaw - curr_yaw))
+
+            if self.search_phase == "ROTATE":
+                if yaw_err <= SEARCH_YAW_TOL:
+                    self.search_phase = "SETTLE"
+                    self.search_settle_counter = 0
                 return
 
-            # 현재 목표 웨이포인트
-            wx, wy, wyaw = self.orbit_waypoints[self.current_waypoint_idx]
-            dist_to_wp = math.hypot(wx - curr_x, wy - curr_y)
+            if self.search_phase == "SETTLE":
+                self.search_settle_counter += 1
+                if self.search_settle_counter >= SEARCH_SETTLE_TICKS:
+                    self.search_phase = "CHECK"
+                return
 
-            # 웨이포인트 도착 확인
-            if dist_to_wp < WAYPOINT_TOLERANCE:
-                self.current_waypoint_idx += 1
-                self.get_logger().info(f"Reached waypoint {self.current_waypoint_idx}/{ORBIT_POINTS}")
+            detected = (self.labels_fresh() and (TARGET_LABEL in self.detected_labels)) or self.nurse_center_fresh()
+            
+            if detected:
+                self.detect_confirm_count += 1
             else:
-                # 목표 지점으로 이동 명령
-                self.publish_goal(wx, wy, wyaw)
+                self.detect_confirm_count = 0
 
-        elif self.state == "FINISHED":
-            pass
+            if self.detect_confirm_count >= DETECT_CONFIRM_N:
+                self.detect_confirm_count = 0
+                self.get_logger().info("Detected -> CENTERING")
+                self.set_state("CENTERING")
+                return
+
+            self.search_yaw = self.wrap_to_pi(self.search_yaw + SEARCH_YAW_STEP)
+            self.search_steps_done += 1
+            self.search_phase = "ROTATE"
+            self.search_settle_counter = 0
+
+            if self.search_steps_done >= self.max_search_steps:
+                self.get_logger().warn("Scan Restart.")
+                self.search_steps_done = 0
+            return
+
+        # 3) CENTERING
+        if self.state == "CENTERING":
+            if self._state_entered:
+                self.get_logger().info("State=CENTERING")
+                self._state_entered = False
+                self.center_stable_cnt = 0
+
+            if not self.nurse_center_fresh():
+                self.get_logger().warn("Lost nurse -> SEARCHING")
+                self.reset_search(curr_yaw)
+                self.set_state("SEARCHING")
+                return
+
+            center_u = self.get_image_center_u()
+            du = self.nurse_u - center_u
+            bearing = self.pixel_to_bearing(self.nurse_u) 
+            yaw_step = self.clamp(bearing, -MAX_YAW_STEP, MAX_YAW_STEP)
+            target_yaw = self.wrap_to_pi(curr_yaw + yaw_step)
+
+            # [수정] Centering 때도 Smart Publish (회전 목표)
+            self.publish_goal_smart(curr_x, curr_y, target_yaw)
+
+            if abs(du) <= CENTER_TOL_PX:
+                self.center_stable_cnt += 1
+                if self.center_stable_cnt >= CENTERING_STABLE_TICKS:
+                    ok = self.freeze_nurse_map(curr_x, curr_y, curr_yaw)
+                    if ok:
+                        cx, cy = self.nurse_map_x, self.nurse_map_y
+                        self.orbit_waypoints = self.build_orbit_waypoints_with_entry(cx, cy, curr_x, curr_y)
+                        self.current_waypoint_idx = 0
+                        self.get_logger().info(f"Go Orbit! (Target: {cx:.2f}, {cy:.2f})")
+                        self.set_state("ORBITING")
+                    else:
+                        self.center_stable_cnt = CENTERING_STABLE_TICKS - 1
+                        self.get_logger().warn("Waiting for Depth...")
+                return
+            else:
+                self.center_stable_cnt = 0
+                return
+
+        # 4) ORBITING
+        if self.state == "ORBITING":
+            if self._state_entered:
+                self.get_logger().info("State=ORBITING")
+                self._state_entered = False
+
+            if not self.orbit_waypoints:
+                self.set_state("FINISHED")
+                return
+
+            wx, wy, wyaw = self.orbit_waypoints[self.current_waypoint_idx]
+            dist = math.hypot(wx - curr_x, wy - curr_y)
+            
+            # [핵심 수정] 여기서 지속 발행하던 것을 smart publish로 변경
+            # 이제 웨이포인트가 바뀔 때만 발행됨 (혹은 3초 지났을 때)
+            self.publish_goal_smart(wx, wy, wyaw) 
+
+            if dist < WAYPOINT_TOLERANCE:
+                self.current_waypoint_idx += 1
+                self.get_logger().info(f"Waypoint {self.current_waypoint_idx} reached.")
+                
+                if self.current_waypoint_idx >= len(self.orbit_waypoints):
+                    if ORBIT_REPEAT:
+                        self.current_waypoint_idx = 1 
+                    else:
+                        self.set_state("FINISHED")
+            return
+
+        # 5) FINISHED
+        if self.state == "FINISHED":
+            return
+
 
 def main(args=None):
     rclpy.init(args=args)
     node = NurseOrbiter()
-    
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.get_logger().info("Node stopped by user")
+        pass
     finally:
         node.destroy_node()
         rclpy.shutdown()
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
