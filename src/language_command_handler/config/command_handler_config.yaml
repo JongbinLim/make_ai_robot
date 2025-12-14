@@ -16,6 +16,7 @@ prompt: |
   - go_back.launch.py: move the robot backward
   - move_to_empty_room.py: navigate to an empty room that doesn't have a stop sign
   - food_searcher.py: Search the environment, find edible food, and bark in front of it.
+  - nurse_orbiter.py: Rotate around the nurse.
 
 
   And here is the user command:
@@ -37,5 +38,6 @@ action_candidates:
     - find_red_cone.py
     - move_to_empty_room.py
     - food_searcher.py
+    - nurse_orbiter.py
   launch:
     - go_back.launch.py
