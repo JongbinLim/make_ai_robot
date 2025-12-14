@@ -72,8 +72,6 @@ struct Voxel {
 };
 
 struct VoxelGridMap {
-    // 맵 크기를 고정 (예: 100x100m 영역 커버 가능한 해시 테이블)
-    // 충돌 처리를 단순화하기 위해 크기를 충분히 크게 잡음 (2^16 = 65536 등)
     static constexpr size_t TABLE_SIZE = 131072; // 2^17
     static constexpr size_t MASK = TABLE_SIZE - 1;
 
@@ -94,7 +92,6 @@ struct VoxelGridMap {
         std::fill(table.begin(), table.end(), Entry{});
     }
 
-    // 간단한 해시 함수
     size_t hash(const Eigen::Vector2i& k) const {
         return ((k.x() * 73856093) ^ (k.y() * 19349663)) & MASK;
     }
@@ -112,13 +109,12 @@ struct VoxelGridMap {
 
             size_t idx = hash(key);
 
-            // Linear Probing (최대 5칸까지만 검색하고 포기 - 속도 우선)
             for(int i=0; i<5; ++i) {
                 size_t curr = (idx + i) & MASK;
                 if (!table[curr].active) {
                     table[curr].active = true;
                     table[curr].key = key;
-                    table[curr].voxel = Voxel(); // reset
+                    table[curr].voxel = Voxel(); 
                     table[curr].voxel.add(p_world);
                     break;
                 } else if (table[curr].key == key) {
@@ -138,7 +134,6 @@ struct VoxelGridMap {
         }
     }
 
-    // 9-Neighbor Search 최적화
     bool get_closest_line(const Eigen::Vector2d& pt_world, double max_dist,
                           Eigen::Vector2d& out_mean, Eigen::Vector2d& out_normal) const {
         Eigen::Vector2i center_key;
@@ -148,16 +143,14 @@ struct VoxelGridMap {
         double min_dist_sq = max_dist * max_dist;
         const Voxel* best_voxel = nullptr;
 
-        // Loop Unrolling 및 해시 룩업 최소화
         for (int dx = -1; dx <= 1; ++dx) {
             for (int dy = -1; dy <= 1; ++dy) {
                 Eigen::Vector2i query = center_key + Eigen::Vector2i(dx, dy);
                 size_t idx = hash(query);
 
-                // Linear Probing 탐색
                 for(int i=0; i<5; ++i) {
                     size_t curr = (idx + i) & MASK;
-                    if(!table[curr].active) break; // 빈칸이면 종료 (Cluster assumption)
+                    if(!table[curr].active) break; 
 
                     if(table[curr].key == query && table[curr].voxel.is_ready) {
                          double dist_sq = (table[curr].voxel.mean - pt_world).squaredNorm();
@@ -165,7 +158,7 @@ struct VoxelGridMap {
                              min_dist_sq = dist_sq;
                              best_voxel = &(table[curr].voxel);
                          }
-                         break; // 키를 찾았으면 다음 dx/dy로
+                         break; 
                     }
                 }
             }
@@ -179,7 +172,6 @@ struct VoxelGridMap {
         return false;
     }
 
-    // remove_far_voxels 최적화: 전체 순회하며 거리 체크
     void remove_far_voxels(const Eigen::Vector2d& center, double radius) {
         double r_sq = radius * radius;
         #pragma omp parallel for
@@ -187,7 +179,7 @@ struct VoxelGridMap {
             if(table[i].active) {
                 Eigen::Vector2d dist = table[i].voxel.mean - center;
                 if (dist.squaredNorm() > r_sq) {
-                    table[i].active = false; // Soft delete
+                    table[i].active = false; 
                 }
             }
         }
@@ -212,6 +204,9 @@ struct KISSICPSolver {
         Eigen::Vector3d current_pose = initial_pose;
 
         for (int iter = 0; iter < max_iterations; ++iter) {
+            // [FIX] 루프 중간에 종료 시그널 체크 (빠른 종료를 위해)
+            if (!rclcpp::ok()) break;
+
             double threshold = adaptive_threshold_initial -
                 (adaptive_threshold_initial - adaptive_threshold_min) * ((double)iter / max_iterations);
 
@@ -225,8 +220,6 @@ struct KISSICPSolver {
             Eigen::Matrix2d R; R << c, -s, s, c;
             Eigen::Vector2d t = current_pose.head<2>();
 
-            // OpenMP를 사용한 병렬 Jacobian 계산
-            // reduction은 복잡하므로 각 스레드별 로컬 변수에 누적 후 합산
             #pragma omp parallel
             {
                 Eigen::Matrix3d H_local = Eigen::Matrix3d::Zero();
@@ -236,6 +229,9 @@ struct KISSICPSolver {
 
                 #pragma omp for nowait
                 for (size_t i = 0; i < src.size(); ++i) {
+                    // [FIX] OpenMP 루프 내에서도 종료 체크 (선택적)
+                    if (i % 100 == 0 && !rclcpp::ok()) continue;
+
                     Eigen::Vector2d p_world = R * src[i] + t;
                     Eigen::Vector2d map_mean, map_normal;
 
@@ -280,7 +276,7 @@ struct KISSICPSolver {
     }
 };
 
-// --- UKF Implementation (복원 및 최적화) ---
+// --- UKF Implementation ---
 class RobotUKF {
 public:
     RobotUKF(float dt) : dt_(dt) {
@@ -301,7 +297,7 @@ public:
         }
     }
 
-    Eigen::VectorXd get_state() { return x_; }
+    Eigen::VectorXd get_state() const { return x_; } // const 추가
 
     void predict(float dt, const Eigen::Vector2d& u) {
         Eigen::MatrixXd sigmas = generate_sigma_points(x_, P_);
@@ -310,11 +306,9 @@ public:
             sigmas_pred.col(i) = motion_model(sigmas.col(i), dt, u);
         }
 
-        // Mean Prediction
         x_.setZero();
         for (int i = 0; i < 11; ++i) x_ += wm_[i] * sigmas_pred.col(i);
 
-        // Angle Averaging
         double sin_sum = 0.0, cos_sum = 0.0;
         for (int i=0; i<11; ++i) {
              sin_sum += wm_[i] * std::sin(sigmas_pred(2,i));
@@ -322,7 +316,6 @@ public:
         }
         x_(2) = std::atan2(sin_sum, cos_sum);
 
-        // Covariance Prediction
         P_.setZero();
         for (int i = 0; i < 11; ++i) {
             Eigen::VectorXd diff = sigmas_pred.col(i) - x_;
@@ -332,7 +325,6 @@ public:
         P_ += Q_ * (dt / dt_);
     }
 
-    // ICP 결과를 Measurement로 사용 (z: [x, y, theta])
     void update_icp(const Eigen::Vector3d& z, double motion_factor) {
         Eigen::MatrixXd sigmas = generate_sigma_points(x_, P_);
         Eigen::MatrixXd Z_sigmas(3, 11);
@@ -376,7 +368,7 @@ public:
 
     void update_imu(double omega) {
          Eigen::RowVectorXd H = Eigen::RowVectorXd::Zero(5);
-         H(4) = 1.0; // State index 4 is omega
+         H(4) = 1.0; 
 
          double z_pred = x_(4);
          double y = omega - z_pred;
@@ -407,11 +399,9 @@ private:
         double v = state(3);
         double omega = state(4);
         double cmd_v = u(0);
-        // double cmd_omega = u(1); // Not used directly in simple model, implicit in omega
-
-        // Simple velocity decay/response model
+        
         double next_v = v + 0.1 * (cmd_v - v);
-        double next_omega = omega; // Assume constant angular velocity for short dt
+        double next_omega = omega; 
 
         double next_x, next_y;
         if (std::abs(omega) > 1e-5) {
@@ -467,20 +457,24 @@ public:
 
 private:
     void cmd_vel_callback(const geometry_msgs::msg::Twist::SharedPtr msg) {
+        // Twist msg 복사는 매우 빠르므로 lock 유지
         std::lock_guard<std::mutex> lock(mutex_);
         current_cmd_ << msg->linear.x, msg->angular.z;
         last_cmd_time_ = this->now().seconds();
     }
 
     void imu_callback(const sensor_msgs::msg::Imu::SharedPtr msg) {
+        // [FIX] IMU 처리는 빠르지만, Scan 처리로 인해 Lock을 획득하지 못해 TF가 밀리는 것이 문제.
+        // 아래 scan_callback에서 Lock 점유 시간을 줄였으므로 여기서는 Lock을 써도 괜찮음.
         std::lock_guard<std::mutex> lock(mutex_);
+        
         double current_time = rclcpp::Time(msg->header.stamp).seconds();
         double omega = msg->angular_velocity.z;
 
         Eigen::Vector2d u = current_cmd_;
         double now_sec = this->now().seconds();
         if ((now_sec - last_cmd_time_) > 0.5) {
-            u.setZero(); // 명령이 끊긴지 0.5초가 지나면 정지로 간주
+            u.setZero();
         }
 
         if (last_imu_time_ < 0) {
@@ -491,7 +485,6 @@ private:
         double dt = current_time - last_imu_time_;
         if (dt <= 0) return;
 
-        // UKF Prediction Step (Sub-stepping for stability)
         double max_step = 0.05;
         double remain = dt;
         while (remain > 1e-6) {
@@ -501,6 +494,8 @@ private:
         }
 
         ukf_.update_imu(omega);
+        
+        // [중요] TF는 여기서 Lock을 가진 상태로 안전하게 발행
         publish_tf(msg->header.stamp);
 
         last_imu_time_ = current_time;
@@ -508,7 +503,7 @@ private:
         if (imu_history_.size() > 2000) imu_history_.pop_front();
     }
 
-    // IMU 보간 함수 (Deskewing용)
+    // ... (get_interpolated_omega, deskew_scan 함수는 그대로 유지 - 생략 가능) ...
     double get_interpolated_omega(double t) {
         if (imu_history_.empty()) return 0.0;
         if (t <= imu_history_.front().first) return imu_history_.front().second;
@@ -521,15 +516,14 @@ private:
 
         if (it == imu_history_.begin()) return it->second;
         auto prev = std::prev(it);
-
         double dt = it->first - prev->first;
         if (dt < 1e-9) return prev->second;
-
         double r = (t - prev->first) / dt;
         return prev->second + r * (it->second - prev->second);
     }
 
     std::vector<Eigen::Vector2d> deskew_scan(const sensor_msgs::msg::LaserScan::SharedPtr& msg, double v, double omega) {
+        // [NOTE] 이 함수는 무겁지만 클래스 멤버 변수를 건드리지 않으므로 lock 밖에서 실행 가능
         std::vector<Eigen::Vector2d> points;
         points.resize(msg->ranges.size());
 
@@ -538,7 +532,6 @@ private:
         double time_inc = msg->time_increment;
         if (time_inc < 1e-9) time_inc = msg->scan_time / std::max((size_t)1, msg->ranges.size());
 
-        // Parallel Deskewing
         #pragma omp parallel for
         for (size_t i = 0; i < msg->ranges.size(); ++i) {
             float r = msg->ranges[i];
@@ -546,26 +539,18 @@ private:
                 points[i] = Eigen::Vector2d(0,0);
                 continue;
             }
-
             double dt = i * time_inc;
             double delta_theta = omega * dt;
-
-            // Simple Linear motion compensation
             double delta_x = v * dt;
             double delta_y = 0.0;
-
-            // If rotating fast, use arc motion
             if (std::abs(omega) > 1e-4) {
                  double radius = v / omega;
                  delta_x = radius * std::sin(delta_theta);
                  delta_y = radius * (1.0 - std::cos(delta_theta));
             }
-
             double theta = angle_min + i * angle_inc + delta_theta;
             points[i] = Eigen::Vector2d(r * std::cos(theta) + delta_x, r * std::sin(theta) + delta_y);
         }
-
-        // 유효 포인트 필터링
         std::vector<Eigen::Vector2d> valid_points;
         valid_points.reserve(points.size());
         for(const auto& p : points) {
@@ -575,21 +560,41 @@ private:
     }
 
     void scan_callback(const sensor_msgs::msg::LaserScan::SharedPtr msg) {
-        std::lock_guard<std::mutex> lock(mutex_);
+        // [FIX] 1. 필요한 상태(State)만 빠르게 복사하고 Lock 해제
+        Eigen::VectorXd state;
         double scan_time = rclcpp::Time(msg->header.stamp).seconds();
+        double omega_interp;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            state = ukf_.get_state();
+            // IMU 히스토리에 접근하므로 lock 필요
+            omega_interp = get_interpolated_omega(scan_time);
+        } // Lock 해제됨!
 
-        Eigen::VectorXd state = ukf_.get_state();
         double v = state(3);
 
-        // IMU History에서 해당 스캔 시간의 각속도 추정 (더 정확한 Deskewing을 위해)
-        double omega_interp = get_interpolated_omega(scan_time);
-
+        // [FIX] 2. 무거운 연산(Deskewing, ICP)은 Lock 없이 수행 (병렬성 확보)
+        // 이 동안 IMU Callback은 자유롭게 실행되어 TF를 쏠 수 있음
         std::vector<Eigen::Vector2d> current_points = deskew_scan(msg, v, omega_interp);
 
         if (current_points.size() < 50) return;
 
-        // 맵 초기화
-        if (!map_initialized_) {
+        Eigen::Vector3d guess_pose = state.head<3>();
+        double rmse = 0.0;
+
+        // [중요] map_initialized_ 체크는 읽기만 하더라도 안전을 위해 lock이 좋으나,
+        // 여기선 ICP 결과가 나오기 전까지 map을 건드리지 않으므로(읽기 전용)
+        // ICP 계산 자체는 lock 없이 진행. 단, local_map_이 수정되지 않는다는 가정.
+        // 하지만 초기화 전에는 map add가 일어나므로 분기 처리 필요.
+        
+        bool is_initialized;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            is_initialized = map_initialized_;
+        }
+
+        if (!is_initialized) {
+            std::lock_guard<std::mutex> lock(mutex_);
             local_map_.add_cloud(current_points, state.head<3>());
             local_map_.update_voxels();
             map_initialized_ = true;
@@ -597,39 +602,41 @@ private:
             return;
         }
 
-        // KISS-ICP Align
-        Eigen::Vector3d guess_pose = state.head<3>();
-        double rmse = 0.0;
-
+        // Heavy ICP Aligment (No Lock!)
+        // 로컬 맵은 읽기 전용으로 사용됨 (Race condition 주의: map update는 lock 안에서만 함)
         Eigen::Vector3d aligned_pose = icp_solver_.align(
             current_points, local_map_, guess_pose, rmse
         );
 
-        // UKF Update
-        double motion_factor = 1.0 + 3.0 * std::abs(omega_interp) + 1.0 * std::abs(v);
-        if (rmse < 0.5) {
-            ukf_.update_icp(aligned_pose, motion_factor);
-        } else {
-            RCLCPP_WARN(this->get_logger(), "ICP Diverged (RMSE: %.2f)", rmse);
-        }
+        // 종료 시그널이 왔다면 더 이상 진행하지 않음
+        if (!rclcpp::ok()) return;
 
-        // Keyframe 관리 (Local Map Update)
-        Eigen::Vector3d current_ukf_pose = ukf_.get_state().head<3>();
-        double dist_moved = (current_ukf_pose.head<2>() - last_keyframes_pose_.head<2>()).norm();
-        double angle_moved = std::abs(normalize_angle(current_ukf_pose(2) - last_keyframes_pose_(2)));
+        // [FIX] 3. 결과를 반영할 때만 다시 Lock
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            
+            double motion_factor = 1.0 + 3.0 * std::abs(omega_interp) + 1.0 * std::abs(v);
+            if (rmse < 0.5) {
+                ukf_.update_icp(aligned_pose, motion_factor);
+            } else {
+                RCLCPP_WARN(this->get_logger(), "ICP Diverged (RMSE: %.2f)", rmse);
+            }
 
-        if (dist_moved > 0.5 || angle_moved > 0.2) {
-            local_map_.add_cloud(current_points, current_ukf_pose);
-            local_map_.update_voxels();
-            local_map_.remove_far_voxels(current_ukf_pose.head<2>(), 20.0);
-            last_keyframes_pose_ = current_ukf_pose;
-        }
+            Eigen::Vector3d current_ukf_pose = ukf_.get_state().head<3>();
+            double dist_moved = (current_ukf_pose.head<2>() - last_keyframes_pose_.head<2>()).norm();
+            double angle_moved = std::abs(normalize_angle(current_ukf_pose(2) - last_keyframes_pose_(2)));
 
-        // Scan Callback에서는 TF를 쏘지 않음 (IMU Callback 주기가 더 빠르므로 거기서 담당)
-        // 필요하다면 여기서도 쏠 수 있음
+            if (dist_moved > 0.5 || angle_moved > 0.2) {
+                local_map_.add_cloud(current_points, current_ukf_pose);
+                local_map_.update_voxels();
+                local_map_.remove_far_voxels(current_ukf_pose.head<2>(), 20.0);
+                last_keyframes_pose_ = current_ukf_pose;
+            }
+        } // Lock 해제
     }
 
     void publish_tf(const rclcpp::Time& timestamp) {
+        // 이미 호출하는 쪽(imu_callback)에서 Lock을 잡고 있으므로 바로 접근
         Eigen::VectorXd state = ukf_.get_state();
         geometry_msgs::msg::TransformStamped t;
         t.header.stamp = timestamp;
@@ -649,7 +656,7 @@ private:
 
     RobotUKF ukf_;
     std::mutex mutex_;
-
+    // ... 나머지 변수 동일 ...
     rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
     rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
     rclcpp::Subscription<geometry_msgs::msg::Twist>::SharedPtr cmd_sub_;
