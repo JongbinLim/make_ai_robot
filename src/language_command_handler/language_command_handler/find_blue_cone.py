@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visit three poses, look for green_cone, bark if found."""
+"""Visit three poses, look for blue_cone, bark if found."""
 
 import math
 from typing import Optional, Tuple
@@ -18,7 +18,7 @@ VISIT_POINTS = [
     (1.21, 14.25, 1.57),
     (2.21, 14.25, 1.57),
 ]
-DEFAULT_LABEL = "cone green"
+DEFAULT_LABEL = "cone blue"
 EVAL_DELAY = 3.0  # seconds to wait after stop
 
 # Robustness parameters
@@ -39,7 +39,7 @@ def yaw_to_quaternion(yaw: float) -> Quaternion:
 
 
 class FindCone(Node):
-    def __init__(self, target_label: str = DEFAULT_LABEL, node_name: str = "find_green_cone") -> None:
+    def __init__(self, target_label: str = DEFAULT_LABEL, node_name: str = "find_blue_cone") -> None:
         super().__init__(node_name)
 
         # ---- Inputs/state ----
@@ -88,7 +88,7 @@ class FindCone(Node):
         self.create_subscription(String, "/detections/labels", self.labels_cb, 10)
 
         self.create_timer(0.1, self.control_loop)
-        self.get_logger().info("find_green_cone started. Waiting for /go1_pose...")
+        self.get_logger().info("find_blue_cone started. Waiting for /go1_pose...")
 
     # -----------------------------
     # Callbacks (do NOT publish here)
