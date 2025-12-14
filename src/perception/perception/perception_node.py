@@ -3,8 +3,9 @@ import rclpy
 from rclpy.node import Node
 
 from sensor_msgs.msg import Image, CameraInfo
-from std_msgs.msg import String, Float32
+from std_msgs.msg import String, Float32, Bool
 from cv_bridge import CvBridge
+
 
 import numpy as np
 import cv2
@@ -54,7 +55,7 @@ class PerceptionNode(Node):
         self.camera_info = None
 
         # 먹을 수 있는 물체(예시)
-        self.edible_objects = {"apple", "banana", "orange", "cake"}
+        self.edible_objects = {"apple", "banana", "pizza"}
         
         self.stop_labels = {"stop sign"}
 
