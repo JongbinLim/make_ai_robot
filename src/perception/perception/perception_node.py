@@ -60,6 +60,10 @@ class PerceptionNode(Node):
         self.stop_labels = {"stop sign"}
 
         self.get_logger().info("PerceptionNode initialized.")
+        
+        self.bark_distance_threshold = 0.4  # meters (tune)
+        self.bark_cooldown_sec = 2.0
+        self.last_bark_time = self.get_clock().now()
 
     # ---------------------------
     # Callbacks
@@ -167,9 +171,22 @@ class PerceptionNode(Node):
         # ---------------------------
         # Publish bark / None
         # ---------------------------
-        # 중앙 60% 안에서 잡힌 "가장 가까운" 물체가 edible이면 bark
-        if target_label is not None and target_label in self.edible_objects:
+
+        now = self.get_clock().now()
+        cooldown_ok = (now - self.last_bark_time).nanoseconds > int(self.bark_cooldown_sec * 1e9)
+
+        # Bark only if: closest target is edible AND distance is valid AND close enough AND cooldown passed
+        if (
+            cooldown_ok
+            and target_label is not None
+            and target_label in self.edible_objects
+            and distance_to_target > 0
+            and distance_to_target <= self.bark_distance_threshold
+        ):
+        
             bark_msg = "bark"
+            self.last_bark_time = now
+
 
         bark = String()
         bark.data = bark_msg
