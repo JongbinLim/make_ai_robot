@@ -23,8 +23,8 @@ from std_msgs.msg import Bool
 
 # 두 빈 방의 좌표 (x, y, yaw)
 VACANT_ROOMS = [
-    (6.68, 11.9, 1.57),    # Room A
-    (-6.68, 11.9, 1.57),   # Room B
+    (7.53, 13.44, 0.77),    # Room A
+    (-7.24, 13.26, 2.07),   # Room B
 ]
 
 # 목표 지점 반경 내에서만 stop sign 인정
