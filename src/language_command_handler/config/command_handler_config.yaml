@@ -14,6 +14,8 @@ prompt: |
   - find_green_cone.py: find green cone
   - find_red_cone.py: find red cone
   - go_back.launch.py: move the robot backward
+  - move_to_empty_room.py: navigate to an empty room that doesn't have a stop sign
+  - food_searcher.py: Search the environment, find edible food, and bark in front of it.
 
 
   And here is the user command:
@@ -33,5 +35,7 @@ action_candidates:
     - find_blue_cone.py
     - find_green_cone.py
     - find_red_cone.py
+    - move_to_empty_room.py
+    - food_searcher.py
   launch:
     - go_back.launch.py
