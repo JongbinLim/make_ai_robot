@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visit three poses, look for red_cone, bark if found."""
+"""Visit three poses, look for red_cone in NARROW FOV, bark if found."""
 
 import math
 from typing import Optional, Tuple
@@ -14,9 +14,9 @@ from nav_msgs.msg import Path
 
 
 VISIT_POINTS = [
-    (0.21, 15, 1.57),
-    (1.21, 15, 1.57),
-    (2.21, 15, 1.57),
+    (0.21, 14, 1.57),
+    (1.21, 14, 1.57),
+    (2.21, 14, 1.57),
 ]
 DEFAULT_LABEL = "cone red"
 EVAL_DELAY = 3.0  # seconds to wait after stop
@@ -46,7 +46,9 @@ class FindCone(Node):
         self.current_pose: Optional[PoseStamped] = None
         self.goal_reached = False
         self.yaw_align_active = False
-        self.latest_labels: Optional[str] = None
+        
+        # [수정] 좁은 시야각 라벨을 저장할 변수
+        self.latest_narrow_labels: Optional[str] = None
         self.target_label = target_label
 
         # ---- Mission state ----
@@ -85,7 +87,9 @@ class FindCone(Node):
         self.create_subscription(PoseStamped, "/go1_pose", self.pose_cb, 10)
         self.create_subscription(Bool, "/goal_reached", self.goal_cb, 10)
         self.create_subscription(Bool, "/yaw_align_active", self.yaw_cb, 10)
-        self.create_subscription(String, "/detections/labels", self.labels_cb, 10)
+        
+        # [수정] 기존 "/detections/labels" 대신 좁은 시야각 토픽 구독
+        self.create_subscription(String, "/detections/narrow/labels", self.narrow_labels_cb, 10)
 
         self.create_timer(0.1, self.control_loop)
         self.get_logger().info("find_red_cone started. Waiting for /go1_pose...")
@@ -102,8 +106,9 @@ class FindCone(Node):
     def yaw_cb(self, msg: Bool):
         self.yaw_align_active = msg.data
 
-    def labels_cb(self, msg: String):
-        self.latest_labels = msg.data
+    # [수정] 콜백 함수 이름 및 저장 변수 변경
+    def narrow_labels_cb(self, msg: String):
+        self.latest_narrow_labels = msg.data
 
     # -----------------------------
     # Helpers
@@ -126,9 +131,14 @@ class FindCone(Node):
         return int(s * 1e9)
 
     def condition_met(self) -> bool:
-        if not self.latest_labels:
+        # [수정] 좁은 시야각 데이터 확인
+        if not self.latest_narrow_labels:
             return False
-        labels = [s.strip() for s in self.latest_labels.split(",") if s.strip()]
+        
+        # 쉼표로 구분된 라벨 파싱
+        labels = [s.strip() for s in self.latest_narrow_labels.split(",") if s.strip()]
+        
+        # 타겟 라벨이 좁은 시야각 안에 있는지 확인
         return self.target_label in labels
 
     def bark_and_shutdown(self):
@@ -137,7 +147,7 @@ class FindCone(Node):
         msg = String()
         msg.data = "bark"
         self.speech_pub.publish(msg)
-        self.get_logger().info(f"Detected {self.target_label}. Barking and shutting down.")
+        self.get_logger().info(f"Detected {self.target_label} in NARROW FOV. Barking and shutting down.")
         self.finished = True
         self.bark_sent = True
         rclpy.shutdown()
@@ -290,7 +300,7 @@ class FindCone(Node):
                 self.publish_empty_path_and_stop()
                 self.evaluating = True
                 self.eval_start_ns = self._now_ns()
-                self.get_logger().info(f"Arrived. Waiting {EVAL_DELAY}s then checking detections...")
+                self.get_logger().info(f"Arrived. Waiting {EVAL_DELAY}s then checking detections (NARROW)...")
                 return
 
             return
@@ -315,7 +325,7 @@ class FindCone(Node):
             self.active_goal_xy = None
 
             if self.visit_idx >= len(VISIT_POINTS):
-                self.get_logger().info(f"No {self.target_label} detected after all visits. Shutting down.")
+                self.get_logger().info(f"No {self.target_label} detected in NARROW FOV after all visits. Shutting down.")
                 self.finished = True
                 rclpy.shutdown()
                 return
