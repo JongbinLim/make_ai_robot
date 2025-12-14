@@ -15,7 +15,7 @@ path_tracker:
     NX: 4                        # State dimension [x, y, velocity, yaw]
     NU: 2                        # Control input dimension [linear_vel, angular_vel]
     K: 500                       # Number of sample trajectories
-    T: 20                        # Prediction horizon steps
+    T: 25                        # Prediction horizon steps
     DT: 0.1                      # Time step (seconds)
     DL: 0.1                      # Distance step for path discretization
     
