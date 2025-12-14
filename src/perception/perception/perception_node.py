@@ -46,6 +46,7 @@ class PerceptionNode(Node):
         self.pub_labels = self.create_publisher(String, "/detections/labels", 10)
         self.pub_distance = self.create_publisher(Float32, "/detections/distance", 10)
         self.pub_speech = self.create_publisher(String, "/robot_dog/speech", 10)
+        self.pub_stop_sign = self.create_publisher(Bool, "/perception/stop_sign", 10)
 
         # 저장 공간
         self.rgb_image = None
@@ -54,6 +55,8 @@ class PerceptionNode(Node):
 
         # 먹을 수 있는 물체(예시)
         self.edible_objects = {"apple", "banana", "orange", "cake"}
+        
+        self.stop_labels = {"stop sign"}
 
         self.get_logger().info("PerceptionNode initialized.")
 
@@ -99,6 +102,8 @@ class PerceptionNode(Node):
         distance_to_target = -1.0
         target_label = None
         bark_msg = "None"
+        
+        stop_sign_detected = False
 
         # depth 이미지 크기
         dh, dw = self.depth_image.shape[:2]
@@ -116,6 +121,9 @@ class PerceptionNode(Node):
 
             label = results.names[int(cls)]
             labels.append(label)
+            
+            if label in self.stop_labels:
+                stop_sign_detected = True
 
             # depth 범위 체크
             if 0 <= cx < dw and 0 <= cy < dh:
@@ -165,6 +173,10 @@ class PerceptionNode(Node):
         bark = String()
         bark.data = bark_msg
         self.pub_speech.publish(bark)
+        
+        stop_msg = Bool()
+        stop_msg.data = stop_sign_detected
+        self.pub_stop_sign.publish(stop_msg)    
 
 
 def main(args=None):
