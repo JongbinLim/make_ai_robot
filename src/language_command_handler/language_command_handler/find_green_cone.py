@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Visit three poses, look for red_cone, bark if found."""
+"""Visit three poses, look for green_cone, bark if found."""
 
 import math
 from typing import Optional, Tuple
@@ -14,9 +14,9 @@ from nav_msgs.msg import Path
 
 
 VISIT_POINTS = [
-    (0.21, 15, 1.57),
-    (1.21, 15, 1.57),
-    (2.21, 15, 1.57),
+    (0.21, 14.25, 1.57),
+    (1.21, 14.25, 1.57),
+    (2.21, 14.25, 1.57),
 ]
 DEFAULT_LABEL = "cone green"
 EVAL_DELAY = 3.0  # seconds to wait after stop
