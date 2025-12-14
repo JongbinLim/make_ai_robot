@@ -2,7 +2,7 @@
 
 import os
 from launch import LaunchDescription
-from launch.actions import (AppendEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable)
+from launch.actions import (AppendEnvironmentVariable, DeclareLaunchArgument, IncludeLaunchDescription, OpaqueFunction, SetEnvironmentVariable, TimerAction)
 from launch.conditions import IfCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
@@ -225,6 +225,13 @@ def generate_launch_description():
             '-Y', yaw
         ])
 
+    # [수정됨] TimerAction을 사용하여 로봇 스폰을 지연시킴
+    # period=5.0 은 5초 딜레이를 의미합니다. 컴퓨터 사양에 따라 늘리거나 줄이세요.
+    delayed_spawner_cmd = TimerAction(
+        period=15.0,
+        actions=[start_gazebo_ros_spawner_cmd]
+    )
+
     # Publish the pointcloud from the depth camera (face and top)
     go1_pointcloud_publisher_cmd = Node(
         package='go1_simulation',
@@ -270,7 +277,8 @@ def generate_launch_description():
     ld.add_action(start_gazebo_ros_bridge_cmd)
     ld.add_action(robot_state_publisher_cmd)
     ld.add_action(load_controllers_cmd)
-    ld.add_action(start_gazebo_ros_spawner_cmd)
+    #ld.add_action(start_gazebo_ros_spawner_cmd)
+    ld.add_action(delayed_spawner_cmd)
     ld.add_action(go1_pointcloud_publisher_cmd)
     ld.add_action(go1_gt_pose_publisher_cmd)
 
