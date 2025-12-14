@@ -286,7 +286,7 @@ private:
       double goal_dy = current_pose_.pose.position.y - goal_pose_.pose.position.y;
       double goal_distance = std::sqrt(goal_dx * goal_dx + goal_dy * goal_dy);
 
-      if (goal_distance < 0.2) {  // Goal reached threshold (위치 기준)
+      if (goal_distance < 0.1) {  // Goal reached threshold (위치 기준)
         if (!goal_reached_) {
           RCLCPP_INFO(this->get_logger(), "✓ Goal position reached (within 0.5 m)");
           goal_reached_ = true;
