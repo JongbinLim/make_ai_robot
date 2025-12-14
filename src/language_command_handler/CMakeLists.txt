@@ -34,6 +34,7 @@ install(
     language_command_handler/find_blue_cone.py
     language_command_handler/push_the_box.py
     language_command_handler/move_to_empty_room.py
+    language_command_handler/food_searcher.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
