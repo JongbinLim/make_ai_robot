@@ -53,6 +53,9 @@ class PerceptionNode(Node):
         # [Nurse] 간호사 위치 정보 - Code A 기능
         self.pub_nurse_center = self.create_publisher(PointStamped, "/detections/nurse_center", 10)
 
+        # [NEW] 음식 위치 정보 (FoodSmartSearcher용)
+        self.pub_food_center = self.create_publisher(PointStamped, "/detections/food_center", 10)
+
         # Storage
         self.rgb_image = None
         self.depth_image = None
@@ -67,7 +70,7 @@ class PerceptionNode(Node):
         self.bark_cooldown_sec = 2.0
         self.last_bark_time = self.get_clock().now()
 
-        self.get_logger().info("PerceptionNode initialized (Merged).")
+        self.get_logger().info("PerceptionNode initialized (Merged + Food Center).")
 
     # ---------------------------
     # Depth helper (From Code A)
@@ -144,6 +147,11 @@ class PerceptionNode(Node):
         nurse_cx, nurse_cy, nurse_depth = -1, -1, -1.0
         best_nurse_depth = None  # 여러 명일 경우 가장 가까운 사람
 
+        # [NEW] Food 관련 변수
+        food_found = False
+        food_cx, food_cy, food_depth = -1, -1, -1.0
+        best_food_depth = None # 여러 음식 중 가장 가까운 것
+
         dh, dw = self.depth_image.shape[:2]
 
         for xyxy, cls in zip(results.boxes.xyxy, results.boxes.cls):
@@ -170,35 +178,47 @@ class PerceptionNode(Node):
             else:
                 depth_center = -1.0
 
-            # ---------- Nurse Logic (Code A 방식) ----------
+            # ---------- Nurse Logic ----------
             if label == "nurse":
                 nurse_found = True
-                # bbox의 80% 높이 지점 샘플링
                 sample_y = int(y1 + 0.8 * (y2 - y1))
                 sample_x = cx
 
                 if 0 <= sample_x < dw and 0 <= sample_y < dh:
-                    # 배경이 섞여도 가까운 쪽(사람)을 잡기 위해 q=30 사용
                     depth_sample = self.robust_depth(self.depth_image, sample_x, sample_y, k=9, q=30)
                 else:
                     depth_sample = -1.0
 
-                # fallback: 샘플이 이상하면 센터값 사용
                 if depth_sample <= 0 and depth_center > 0:
                     depth_sample = depth_center
                 
-                # "가장 가까운 nurse" 갱신
                 if depth_sample > 0:
                     if best_nurse_depth is None or depth_sample < best_nurse_depth:
                         best_nurse_depth = depth_sample
                         nurse_cx, nurse_cy, nurse_depth = cx, cy, depth_sample
                 else:
-                    # depth를 못 찾았어도 좌표는 저장 (우선순위 낮음)
                     if best_nurse_depth is None and (nurse_cx, nurse_cy) == (-1, -1):
                         nurse_cx, nurse_cy, nurse_depth = cx, cy, -1.0
                 
-                # 디버깅: 샘플 포인트 표시
                 cv2.circle(img, (cx, int(y1 + 0.8 * (y2 - y1))), 5, (255, 0, 0), -1)
+
+            # ---------- [NEW] Food Logic (for FoodSmartSearcher) ----------
+            if label in self.edible_objects:
+                food_found = True
+                # 음식은 작으므로 그냥 Center Depth 사용 (depth_center)
+                
+                if depth_center > 0:
+                    # 가장 가까운 음식 선택
+                    if best_food_depth is None or depth_center < best_food_depth:
+                        best_food_depth = depth_center
+                        food_cx, food_cy, food_depth = cx, cy, depth_center
+                else:
+                    # Depth가 안 잡혀도 좌표는 저장 (Visual Servoing용)
+                    if best_food_depth is None and (food_cx, food_cy) == (-1, -1):
+                         food_cx, food_cy, food_depth = cx, cy, -1.0
+
+                # 디버깅: 초록색 점
+                cv2.circle(img, (cx, cy), 5, (0, 255, 0), -1)
 
             # ---------- 전체 타겟 최소 거리 갱신 ----------
             if depth_center > 0 and (distance_to_target < 0 or depth_center < distance_to_target):
@@ -286,6 +306,24 @@ class PerceptionNode(Node):
             nurse_msg.point.z = -1.0
         
         self.pub_nurse_center.publish(nurse_msg)
+
+        # ---------------------------
+        # Publish 7: Food Center (NEW)
+        # ---------------------------
+        food_msg = PointStamped()
+        food_msg.header = nurse_msg.header # 같은 헤더 사용
+
+        if food_found:
+            # FoodSmartSearcher에서 point.x를 u(pixel x)로, point.z를 depth로 사용
+            food_msg.point.x = float(food_cx)
+            food_msg.point.y = float(food_cy)
+            food_msg.point.z = float(food_depth if food_depth > 0 else -1.0)
+        else:
+            food_msg.point.x = -1.0
+            food_msg.point.y = -1.0
+            food_msg.point.z = -1.0
+            
+        self.pub_food_center.publish(food_msg)
 
 def main(args=None):
     rclpy.init(args=args)
