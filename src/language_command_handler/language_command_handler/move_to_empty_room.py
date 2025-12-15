@@ -28,7 +28,7 @@ VACANT_ROOMS = [
 ]
 
 # 목표 지점 반경 내에서만 stop sign 인정
-STOP_CHECK_DISTANCE_THRESHOLD = 3.0
+STOP_CHECK_DISTANCE_THRESHOLD = 5.0
 
 # Robustness parameters
 GOAL_BURST_DURATION = 1.0        # seconds: republish fast right after setting a goal
