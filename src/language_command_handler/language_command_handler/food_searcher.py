@@ -12,13 +12,13 @@ from sensor_msgs.msg import CameraInfo
 # Mission Constants
 # -----------------------------
 ROOM_LIST = [
-    ("Room 1", -5.14, 15.62, 1.29),
+    ("Room 7", 9.38, 4.90, 0.23),
+    ("Room 1", -5.14, 15.62, 1.29), 
     ("Room 2", -6.78, 12.53, 2.55),
     ("Room 3", -9.27, 11.15, -2.64),
     ("Room 4", -9.40, 4.84, 2.43),
     ("Room 5", -2.86, -0.29, -0.81),
     ("Room 6", 2.81, -0.33, -2.26),
-    ("Room 7", 9.38, 4.90, 0.23),
     ("Room 8", 9.49, 11.11, -0.37),
     ("Room 9", 5.08, 15.58, 1.36),
     ("Room 10", 5.17, 15.33, 1.88),
@@ -37,69 +37,69 @@ ROOM_LIST = [
 EDIBLE_SET = {"apple", "banana", "pizza"}
 
 # Tuning Parameters
-CONTROL_PERIOD = 0.2          # 5Hz (빠른 반응)
-GOAL_RESEND_PERIOD = 3.0      # 목표 재전송 주기 (Smart Publish)
-BARK_DISTANCE_THRESHOLD = 0.5 # 짖는 거리
-ARRIVAL_THRESHOLD = 0.5       # 방 도착 판정
+CONTROL_PERIOD = 0.2          
+GOAL_RESEND_PERIOD = 2.0      
+BARK_DISTANCE_THRESHOLD = 0.6 
+ARRIVAL_THRESHOLD = 0.6       
 
 # Centering & Approach
-CENTER_TOL_PX = 40.0          # 화면 중앙 허용 오차 (pixel)
-MAX_YAW_STEP = math.radians(20)
-CENTERING_STABLE_TICKS = 3    # 몇 번 연속 중앙에 있어야 안정된 것으로 볼지
-IMG_WIDTH_FALLBACK = 640.0    # CameraInfo 없을 때 기본값
+CENTER_TOL_PX = 60.0          
+MAX_YAW_STEP = math.radians(25) 
+CENTERING_STABLE_TICKS = 2     
+IMG_WIDTH_FALLBACK = 640.0
+DETECTION_TIMEOUT = 4.0        
+CENTERING_TIMEOUT_SEC = 10.0  
+
+# [NEW] 짖는 주기 (초 단위)
+BARK_INTERVAL = 0.1  
 
 class FoodSmartSearcher(Node):
     def __init__(self):
         super().__init__('food_smart_searcher')
         
-        # State Machine: PATROL -> CENTERING -> APPROACH -> WAITING_BARK -> COMPLETE
+        # State Machine
         self.state = "PATROL"
-        self._state_entered = True
+        self.state_start_time = self.get_clock().now()
 
-        # -----------------------------
         # Data Containers
-        # -----------------------------
         self.current_pose: PoseStamped | None = None
         self.camera_info: CameraInfo | None = None
         
         self.detected_labels = set()
-        self.food_u = -1.0      # 음식의 화면상 가로 좌표 (pixel)
-        self.food_depth = -1.0  # 음식까지의 거리 (m)
+        self.food_u = -1.0      
+        self.food_depth = -1.0 
         
         self.last_detection_time = None
         self.center_stable_cnt = 0
         
-        # Frozen Target (맵 상의 음식 절대 좌표)
+        # Frozen Target
         self.target_map_x = None
         self.target_map_y = None
 
         # Smart Goal Publishing Variables
-        self.last_published_target = None  # (x, y, yaw)
+        self.last_published_target = None 
         self.last_goal_pub_time = None
 
-        # Room Index
         self.room_index = 0
+        self.patrol_finish_timer = None
 
-        # -----------------------------
+        # [NEW] Barking Timer Variable
+        self.last_bark_time = None
+
         # Subscribers & Publishers
-        # -----------------------------
         qos = QoSProfile(depth=10)
         
         self.pose_sub = self.create_subscription(PoseStamped, "/go1_pose", self.pose_callback, qos)
         self.labels_sub = self.create_subscription(String, "/detections/labels", self.labels_callback, qos)
         self.dist_sub = self.create_subscription(Float32, "/detections/distance", self.distance_callback, qos)
-        self.speech_sub = self.create_subscription(String, "/robot_dog/speech", self.speech_callback, qos)
         self.caminfo_sub = self.create_subscription(CameraInfo, "/camera_top/camera_info", self.caminfo_callback, qos)
-
-        # [중요] 음식의 중심점(u, v) 혹은 (u, depth)를 주는 토픽이 필요함.
-        # 기존 코드에는 없었으나 Visual Servoing을 위해 추가 권장.
-        # 만약 없다면 self.food_u를 이미지 중앙값으로 강제해야 함.
         self.center_sub = self.create_subscription(PointStamped, "/detections/food_center", self.center_callback, qos)
-
+        
         self.goal_pub = self.create_publisher(PoseStamped, "/goal_pose", 10)
+        self.voice_pub = self.create_publisher(String, "/robot_dog/speech", 10)
         
         self.timer = self.create_timer(CONTROL_PERIOD, self.control_loop)
-        self.get_logger().info("Food Smart Searcher Started.")
+        self.get_logger().info("Food Smart Searcher Started: Continuous Bark Mode.")
 
     # -----------------------------
     # Callbacks
@@ -114,42 +114,38 @@ class FoodSmartSearcher(Node):
             self.last_detection_time = self.get_clock().now()
 
     def distance_callback(self, msg: Float32):
-        # 기존 distance 토픽 사용
-        self.food_depth = msg.data
+        if msg.data > 0.1: 
+            self.food_depth = msg.data
 
     def center_callback(self, msg: PointStamped):
-        # NurseOrbiter처럼 중심점(u) 정보를 받음
         self.food_u = msg.point.x
 
     def caminfo_callback(self, msg: CameraInfo):
         self.camera_info = msg
 
-    def speech_callback(self, msg: String):
-        if self.state == "WAITING_BARK" and "bark" in msg.data.lower():
-            self.get_logger().info("!!! MISSION COMPLETE (Bark Detected) !!!")
-            self.set_state("COMPLETE")
-
     # -----------------------------
-    # Smart Goal Publishing (핵심 기능)
+    # Smart Goal Publishing
     # -----------------------------
     def publish_goal_smart(self, x, y, yaw):
         now = self.get_clock().now()
         
-        # 1. 변경 감지
         is_different = False
+        
         if self.last_published_target is None:
             is_different = True
         else:
             lx, ly, lyaw = self.last_published_target
-            diff = math.hypot(lx - x, ly - y) + abs(lyaw - yaw)
-            if diff > 0.05: # 5cm 또는 0.05rad 이상 차이날 때만 갱신
+            
+            dist_diff = math.hypot(lx - x, ly - y)
+            yaw_diff = abs(lyaw - yaw)
+
+            if dist_diff > 0.03 or yaw_diff > 0.03: 
                 is_different = True
 
-        # 2. 타임아웃 (Keep-alive)
         is_timeout = False
         if self.last_goal_pub_time is not None:
             elapsed = (now - self.last_goal_pub_time).nanoseconds * 1e-9
-            if elapsed > GOAL_RESEND_PERIOD:
+            if elapsed > 0.5: 
                 is_timeout = True
         else:
             is_timeout = True
@@ -178,8 +174,14 @@ class FoodSmartSearcher(Node):
         if self.state != s:
             self.get_logger().info(f"State Transition: {self.state} -> {s}")
             self.state = s
-            self._state_entered = True
-            self.last_published_target = None # 상태 변경 시 즉시 목표 전송
+            self.state_start_time = self.get_clock().now() 
+            self.last_published_target = None
+            
+            if s == "PATROL":
+                self.food_u = -1.0
+                self.food_depth = -1.0
+                self.patrol_finish_timer = None 
+                self.last_bark_time = None # 상태 초기화 시 짖는 타이머도 리셋
 
     def get_yaw(self):
         if not self.current_pose: return 0.0
@@ -191,7 +193,7 @@ class FoodSmartSearcher(Node):
     def is_detected_fresh(self):
         if self.last_detection_time is None: return False
         elapsed = (self.get_clock().now() - self.last_detection_time).nanoseconds * 1e-9
-        return elapsed < 2.0 # 2초 이내 감지됨
+        return elapsed < DETECTION_TIMEOUT 
 
     def get_image_center_u(self):
         if self.camera_info and self.camera_info.width > 0:
@@ -199,31 +201,50 @@ class FoodSmartSearcher(Node):
         return IMG_WIDTH_FALLBACK * 0.5
 
     def pixel_to_bearing(self, u_px):
-        # Pinhole Camera Model (NurseOrbiter 방식)
         if self.camera_info and len(self.camera_info.k) >= 9:
             fx = self.camera_info.k[0]
             cx = self.camera_info.k[2]
             if fx > 1e-6:
                 return math.atan2((cx - u_px), fx)
         
-        # Fallback (FOV 80도 가정)
         w = IMG_WIDTH_FALLBACK
         hfov = math.radians(80.0)
         ratio = (u_px - (w * 0.5)) / (w * 0.5)
         return -ratio * (hfov * 0.5)
 
     def freeze_food_position(self, curr_x, curr_y, curr_yaw):
-        if self.food_depth <= 0.1: return False
+        if self.food_depth <= 0.1: 
+            self.get_logger().warn(f"Cannot freeze target. Invalid Depth: {self.food_depth}")
+            return False
         
-        # 화면상 위치를 각도로 변환
         bearing = self.pixel_to_bearing(self.food_u)
         abs_yaw = curr_yaw + bearing
         
-        # 맵 상의 절대 좌표 계산 (Map Freeze)
         self.target_map_x = curr_x + self.food_depth * math.cos(abs_yaw)
         self.target_map_y = curr_y + self.food_depth * math.sin(abs_yaw)
-        self.get_logger().info(f"Food Frozen at Map: ({self.target_map_x:.2f}, {self.target_map_y:.2f})")
+        self.get_logger().info(f"Food Frozen at Map: ({self.target_map_x:.2f}, {self.target_map_y:.2f}) | Depth: {self.food_depth:.2f}")
         return True
+
+    # [NEW] Helper function for continuous barking
+    def perform_continuous_bark(self):
+        now = self.get_clock().now()
+        
+        # 아직 한 번도 안 짖었거나, 지난번 짖은 후 충분한 시간이 지났다면
+        should_bark = False
+        if self.last_bark_time is None:
+            should_bark = True
+        else:
+            elapsed = (now - self.last_bark_time).nanoseconds * 1e-9
+            if elapsed > BARK_INTERVAL:
+                should_bark = True
+        
+        if should_bark:
+            msg = String()
+            msg.data = "bark"
+            self.voice_pub.publish(msg)
+            # 로그는 너무 시끄러울 수 있으므로 디버그용으로만 남기거나 생략 가능
+            # self.get_logger().info("Barking while approaching...")
+            self.last_bark_time = now
 
     # -----------------------------
     # Main Loop
@@ -237,20 +258,29 @@ class FoodSmartSearcher(Node):
 
         # [STATE 1] PATROL
         if self.state == "PATROL":
-            # 음식 감지 확인
             if self.is_detected_fresh():
                 self.get_logger().info("Food Detected! Switching to CENTERING.")
                 self.set_state("CENTERING")
                 self.center_stable_cnt = 0
+                self.patrol_finish_timer = None 
+                
+                # 발견 즉시 한 번 짖기 위해 초기화
+                self.last_bark_time = None 
+                self.perform_continuous_bark() 
                 return
             
-            # 모든 방 순찰 완료
             if self.room_index >= len(ROOM_LIST):
-                self.get_logger().info("Patrol Finished. No food found.")
-                self.set_state("COMPLETE")
-                return
+                if self.patrol_finish_timer is None:
+                    self.patrol_finish_timer = self.get_clock().now()
+                    self.get_logger().info("End of path. Scanning for 5 seconds before finishing...")
+                    return 
 
-            # 방으로 이동
+                elapsed_finish = (self.get_clock().now() - self.patrol_finish_timer).nanoseconds * 1e-9
+                if elapsed_finish > 5.0:
+                    self.get_logger().info("Patrol Finished. No food found.")
+                    self.set_state("COMPLETE")
+                return 
+
             target = ROOM_LIST[self.room_index]
             dist = math.hypot(target[1] - curr_x, target[2] - curr_y)
             
@@ -260,61 +290,75 @@ class FoodSmartSearcher(Node):
                 self.get_logger().info(f"Arrived at {target[0]}")
                 self.room_index += 1
 
-        # [STATE 2] CENTERING (Visual Servoing)
+        # [STATE 2] CENTERING
         elif self.state == "CENTERING":
+            # [NEW] Centering 중에도 흥분해서 짖음
+            self.perform_continuous_bark()
+
             if not self.is_detected_fresh():
                 self.get_logger().warn("Lost food during centering -> Back to PATROL")
                 self.set_state("PATROL")
                 return
 
-            # 화면 중앙값과 현재 음식 위치 차이 계산
+            elapsed_state = (self.get_clock().now() - self.state_start_time).nanoseconds * 1e-9
+            if elapsed_state > CENTERING_TIMEOUT_SEC:
+                self.get_logger().warn("Centering Timeout! Trying to APPROACH directly or Next Room.")
+                if self.food_depth > 0.1:
+                    if self.freeze_food_position(curr_x, curr_y, curr_yaw):
+                        self.set_state("APPROACH")
+                    else:
+                         self.set_state("PATROL")
+                else:
+                    self.set_state("PATROL")
+                return
+
             center_u = self.get_image_center_u()
-            # 만약 food_u가 업데이트 안 되었다면 중앙이라고 가정(fallback)
-            u = self.food_u if self.food_u > 0 else center_u 
             
+            if self.food_u <= 0:
+                self.get_logger().info("Waiting for valid food_u coordinates...")
+                return 
+
+            u = self.food_u 
             diff_u = u - center_u
             
-            # 목표 각도 계산 (NurseOrbiter 방식)
             bearing = self.pixel_to_bearing(u)
-            target_yaw = curr_yaw + max(min(bearing, MAX_YAW_STEP), -MAX_YAW_STEP) # Clamp
+            target_yaw = curr_yaw + max(min(bearing, MAX_YAW_STEP), -MAX_YAW_STEP)
             
-            # 제자리 회전 명령 (Smart Publish)
             self.publish_goal_smart(curr_x, curr_y, target_yaw)
 
-            # 중앙 정렬 확인
-            if abs(diff_u) < CENTER_TOL_PX:
+            if abs(diff_u) < CENTER_TOL_PX and self.food_depth > 0.1:
                 self.center_stable_cnt += 1
             else:
                 self.center_stable_cnt = 0
 
-            # 안정적으로 중앙에 왔다면 좌표 고정(Freeze) 후 접근
             if self.center_stable_cnt >= CENTERING_STABLE_TICKS:
                 if self.freeze_food_position(curr_x, curr_y, curr_yaw):
                     self.set_state("APPROACH")
 
-        # [STATE 3] APPROACH (Frozen Coordinates)
+        # [STATE 3] APPROACH
         elif self.state == "APPROACH":
-            # 거리가 가까우면 멈춤
+            # [NEW] 다가가는 중에도 계속 짖음
+            self.perform_continuous_bark()
+
             dist_to_food = math.hypot(self.target_map_x - curr_x, self.target_map_y - curr_y)
             
             if dist_to_food <= BARK_DISTANCE_THRESHOLD:
-                self.get_logger().info("Close enough. Waiting for Bark...")
-                # 제자리에 멈춰서 대기
+                self.get_logger().info("!!! FOUND FOOD (Target Reached) !!!")
+                
+                # 움직임 정지
                 self.publish_goal_smart(curr_x, curr_y, curr_yaw)
-                self.set_state("WAITING_BARK")
-                return
+                
+                # [수정] 마지막으로 한 번 더 짖고 종료 (원한다면 생략 가능, 여기선 확실한 종료 알림용)
+                self.perform_continuous_bark() 
+                self.get_logger().info(">>> Mission Complete: Arrived at Food <<<")
 
-            # 저장된 좌표로 계속 이동 (인식이 끊겨도 이동함)
-            # 바라보는 방향은 목표 지점을 향하도록
+                self.set_state("COMPLETE")
+                return
+            
             goal_yaw = math.atan2(self.target_map_y - curr_y, self.target_map_x - curr_x)
             self.publish_goal_smart(self.target_map_x, self.target_map_y, goal_yaw)
 
-        # [STATE 4] WAITING_BARK
-        elif self.state == "WAITING_BARK":
-            # Speech Callback에서 "COMPLETE"로 변경해줌
-            pass
-
-        # [STATE 5] COMPLETE
+        # [STATE 4] COMPLETE
         elif self.state == "COMPLETE":
             pass
 
