@@ -18,7 +18,7 @@ class PerceptionNode(Node):
         super().__init__('perception_node')
 
         self.bridge = CvBridge()
-        self.model = YOLO("best.pt")
+        self.model = YOLO("src/best.pt")
 
         # Subscribers
         self.rgb_sub = self.create_subscription(
